@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Carry Forward v3 - reads Hermes session history from the SQLite DB.
-Understands git state, session chains, blockers, thrash detection, and self-learning.
+Carry Forward v4 - intelligence layer for Hermes session continuity.
+Transport, not comprehension. Packages what happened; agents do the interpretation.
 
 Usage:
     carry_forward.py context [--include-cron]     # Full context from last session (recommended)
@@ -14,7 +14,9 @@ Usage:
     carry_forward.py blockers                     # Show unresolved blockers
     carry_forward.py block <message>              # Record a blocker
     carry_forward.py unblock <pattern>            # Remove blockers matching pattern
-    carry_forward.py should-continue              # Exit 0 if safe to chain, 1 if thrashing
+    carry_forward.py should-continue              # Exit 0 if safe to chain, 1 if not
+    carry_forward.py check-can-continue [SESSION] # JSON: full continuation decision
+    carry_forward.py record-git-heads SESSION_ID  # Snapshot git HEADs for thrash detection
     carry_forward.py learn                        # Analyze session history, record patterns
 """
 import sqlite3
@@ -23,6 +25,7 @@ import re
 import sys
 import os
 import json
+import time
 from datetime import datetime
 
 DB_PATH = "/home/jericho/.hermes/state.db"
@@ -72,6 +75,19 @@ def get_carry_conn():
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_patterns_type_key
         ON learned_patterns(pattern_type, pattern_key)
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chain_git_heads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            project_dir TEXT NOT NULL,
+            git_head TEXT NOT NULL,
+            recorded_at REAL NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_chain_git_session
+        ON chain_git_heads(session_id)
     """)
     conn.commit()
     return conn
@@ -200,6 +216,116 @@ def cmd_chain(session_id=None):
 
 
 # ---------------------------------------------------------------------------
+# Git HEAD tracking for cross-session diff
+# ---------------------------------------------------------------------------
+
+def record_git_heads(session_id):
+    """Record current git HEAD for all detected projects in a session.
+    Called at session start to establish baseline for thrash detection."""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # Find project paths from session messages
+    cur.execute("""
+        SELECT content FROM messages WHERE session_id = ? AND role IN ('user', 'assistant', 'tool')
+    """, (session_id,))
+    all_text = " ".join(r[0] or "" for r in cur.fetchall())
+    conn.close()
+
+    paths = set(re.findall(r"/home/jericho/[a-zA-Z0-9_/.-]+\.[a-z]{1,4}", all_text))
+    dirs = sorted(set(p.rsplit("/", 1)[0] for p in paths))[:10]
+
+    import time
+    now = time.time()
+    carry_conn = get_carry_conn()
+    recorded = 0
+    for d in dirs:
+        gs = git_status(d)
+        git_root = gs.get("git_root")
+        if not git_root or gs.get("error"):
+            continue
+        try:
+            r = subprocess.run(["git", "rev-parse", "HEAD"],
+                               capture_output=True, text=True, cwd=git_root, timeout=5)
+            if r.returncode == 0:
+                head = r.stdout.strip()
+                carry_conn.execute("""
+                    INSERT INTO chain_git_heads (session_id, project_dir, git_head, recorded_at)
+                    VALUES (?, ?, ?, ?)
+                """, (session_id, git_root, head, now))
+                recorded += 1
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+
+    carry_conn.commit()
+    carry_conn.close()
+    return recorded
+
+
+def check_git_progress(session_id, min_sessions=3):
+    """Check if git HEAD has actually moved across the chain.
+    Returns (progress_made, details_str).
+    This catches 'busy but unproductive' -- sessions that log work but never commit."""
+    # Walk the chain to find the oldest session with recorded git heads
+    conn = get_conn()
+    cur = conn.cursor()
+    chain = []
+    current = session_id
+    visited = set()
+    while current and current not in visited and len(chain) < 15:
+        visited.add(current)
+        cur.execute("SELECT id, parent_session_id FROM sessions WHERE id = ?", (current,))
+        row = cur.fetchone()
+        if not row:
+            break
+        chain.append(row[0])
+        current = row[1]
+    conn.close()
+
+    if len(chain) < min_sessions:
+        return True, f"chain too short ({len(chain)} sessions) for git progress check"
+
+    carry_conn = get_carry_conn()
+    # Get git heads from earliest and latest sessions in chain
+    earliest = chain[-1]
+    latest = chain[0]
+
+    early_heads = carry_conn.execute("""
+        SELECT project_dir, git_head FROM chain_git_heads WHERE session_id = ?
+    """, (earliest,)).fetchall()
+
+    late_heads = carry_conn.execute("""
+        SELECT project_dir, git_head FROM chain_git_heads WHERE session_id = ?
+    """, (latest,)).fetchall()
+    carry_conn.close()
+
+    if not early_heads:
+        return True, "no git heads recorded at chain start (first run?)"
+
+    # Compare heads for matching projects
+    early_map = {d: h for d, h in early_heads}
+    late_map = {d: h for d, h in late_heads}
+
+    moved = 0
+    stuck = 0
+    for proj_dir in early_map:
+        if proj_dir in late_map:
+            if early_map[proj_dir] != late_map[proj_dir]:
+                moved += 1
+            else:
+                stuck += 1
+
+    total = moved + stuck
+    if total == 0:
+        return True, "no matching projects across chain endpoints"
+
+    if moved == 0 and stuck > 0 and len(chain) >= min_sessions:
+        return False, f"git HEAD unchanged across {len(chain)} sessions for {stuck} project(s)"
+
+    return True, f"git moved in {moved}/{total} tracked projects across {len(chain)} sessions"
+
+
+# ---------------------------------------------------------------------------
 # Thrash detection
 # ---------------------------------------------------------------------------
 
@@ -270,25 +396,133 @@ def detect_thrash(session_id=None, lookback=5):
     # this session already has 10+ dead children (runaway loop detection)
     is_thrashing = dead_count >= 3 or child_count >= 10
 
+    # v4: Also check git progress -- catches "busy but unproductive"
+    git_ok, git_details = check_git_progress(session_id)
+    if not git_ok:
+        is_thrashing = True
+        details += f" | {git_details}"
+
     return is_thrashing, dead_count, chain_sessions, details
+
+
+def check_can_continue(session_id=None):
+    """
+    Logic core for continuation decisions. Returns dict:
+      {can_continue, reasons[], thrashing, dead_count, git_progress, blocker_halt, guard_rails}
+    """
+    thrashing, dead_count, chain_sessions, details = detect_thrash(session_id)
+    git_ok, git_details = check_git_progress(session_id or "")
+
+    reasons = []
+    guard_rails = []
+
+    # Check 1: Dead session thrash
+    if thrashing:
+        if dead_count >= 3:
+            reasons.append(f"Thrash: {dead_count} dead sessions in recent chain ({details})")
+        if not git_ok:
+            reasons.append(f"Git stalled: {git_details}")
+
+    # Check 2: Learned pattern guard rails
+    carry_conn = get_carry_conn()
+
+    # 2a: Continuation rates by source -- if current source has <20% rate, warn
+    conn = get_conn()
+    if session_id:
+        src = conn.execute("SELECT source FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        source = src[0] if src else None
+    else:
+        src = conn.execute("""
+            SELECT source FROM sessions
+            WHERE message_count > 5 AND source IN ('cli', 'telegram', 'whatsapp')
+            ORDER BY started_at DESC LIMIT 1
+        """).fetchone()
+        source = src[0] if src else None
+    conn.close()
+
+    if source:
+        rate_row = carry_conn.execute("""
+            SELECT observation FROM learned_patterns
+            WHERE pattern_type = 'continuation_rate' AND pattern_key = ?
+            ORDER BY last_seen DESC LIMIT 1
+        """, (source,)).fetchone()
+        if rate_row:
+            # Parse "XX.X% productive" from observation
+            m = re.match(r'([\d.]+)%\s+productive', rate_row[0])
+            if m and float(m.group(1)) < 15:
+                guard_rails.append(f"Low continuation rate for {source}: {rate_row[0]}")
+                reasons.append(f"Source {source} has historically low continuation success")
+
+    # 2b: Session size warning -- if parent session was massive, continuations tend to die
+    conn = get_conn()
+    if session_id:
+        parent = conn.execute("SELECT parent_session_id FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        if parent and parent[0]:
+            parent_msgs = conn.execute("SELECT message_count FROM sessions WHERE id = ?", (parent[0],)).fetchone()
+            if parent_msgs and parent_msgs[0] > 200:
+                size_row = carry_conn.execute("""
+                    SELECT observation FROM learned_patterns
+                    WHERE pattern_type = 'size_success' AND pattern_key = 'massive'
+                    ORDER BY last_seen DESC LIMIT 1
+                """).fetchone()
+                if size_row:
+                    guard_rails.append(f"Large parent session: {size_row[0]}")
+    conn.close()
+
+    # Check 3: Blocker age threshold
+    blocker_halt = False
+    BLOCKER_HALT_HOURS = 4
+    import time
+    now = time.time()
+    stale_blockers = carry_conn.execute("""
+        SELECT message, created_at FROM blockers
+        WHERE resolved_at IS NULL AND created_at < ?
+    """, (now - (BLOCKER_HALT_HOURS * 3600),)).fetchall()
+    carry_conn.close()
+
+    if stale_blockers:
+        for msg, ts in stale_blockers:
+            age_h = (now - ts) / 3600
+            reasons.append(f"Stale blocker ({age_h:.1f}h old): {msg}")
+        blocker_halt = True
+
+    can_continue = not thrashing and not blocker_halt
+
+    return {
+        "can_continue": can_continue,
+        "reasons": reasons,
+        "guard_rails": guard_rails,
+        "thrashing": thrashing,
+        "dead_count": dead_count,
+        "git_progress": git_details,
+        "blocker_halt": blocker_halt,
+        "thrash_details": details,
+    }
 
 
 def cmd_should_continue(session_id=None):
     """
     Exit code interface for cron scripting.
-    0 = safe to chain, 1 = thrashing / should stop.
+    0 = safe to chain, 1 = thrashing / blockers / should stop.
     Also prints human-readable reasoning.
     """
-    thrashing, dead_count, chain_sessions, details = detect_thrash(session_id)
+    result = check_can_continue(session_id)
 
-    if thrashing:
-        print(f"STOP: Thrash detected ({details})")
-        print("Recent sessions produced no output. Do not chain.")
+    if not result["can_continue"]:
+        print(f"STOP: {', '.join(result['reasons'])}")
+        if result["guard_rails"]:
+            print("Guard rail context:")
+            for gr in result["guard_rails"]:
+                print(f"  - {gr}")
         sys.exit(1)
     else:
-        print(f"OK: No thrash detected ({details})")
-        alive = sum(1 for s in chain_sessions[:5] if s["alive"])
-        print(f"  {alive}/5 recent sessions were productive.")
+        print(f"OK: No blockers detected")
+        print(f"  Thrash: {result['thrash_details']}")
+        print(f"  Git: {result['git_progress']}")
+        if result["guard_rails"]:
+            print("  Notes:")
+            for gr in result["guard_rails"]:
+                print(f"    - {gr}")
         sys.exit(0)
 
 
@@ -611,8 +845,9 @@ def cmd_status(session_id=None):
 # Smart summary extraction
 # ---------------------------------------------------------------------------
 
-def extract_progress(text):
-    """Extract structured progress info from assistant messages."""
+def _extract_progress_fallback(text):
+    """Fallback regex extraction for sessions without structured markers.
+    Only used when no agent-written summary is available."""
     lines = text.split("\n")
     results = {
         "completed": [],
@@ -648,8 +883,38 @@ def extract_progress(text):
     return results
 
 
+def get_last_assistant_messages(session_id, count=3, max_chars=2000):
+    """Get the last N assistant messages verbatim. This is the primary
+    handoff mechanism -- agents interpret, carry_forward transports."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT content FROM messages
+        WHERE session_id = ? AND role = 'assistant'
+        ORDER BY timestamp DESC LIMIT ?
+    """, (session_id, count))
+    msgs = [r[0] for r in cur.fetchall() if r[0]]
+    conn.close()
+
+    # Return in chronological order, capped at max_chars total
+    msgs.reverse()
+    total = 0
+    result = []
+    for m in msgs:
+        if total + len(m) > max_chars:
+            # Truncate the last one to fit
+            remaining = max_chars - total
+            if remaining > 100:
+                result.append(m[:remaining] + "\n... (truncated)")
+            break
+        result.append(m)
+        total += len(m)
+    return result
+
+
 def cmd_summary(session_id=None):
-    """Smart summary of session progress."""
+    """Smart summary of session progress. Primary: raw assistant messages.
+    Fallback: regex extraction if no messages available."""
     conn = get_conn()
     cur = conn.cursor()
 
@@ -667,7 +932,7 @@ def cmd_summary(session_id=None):
         conn.close()
         return
 
-    # Get all assistant messages (they contain the work record)
+    # Get all assistant messages for fallback extraction
     cur.execute("""
         SELECT content FROM messages
         WHERE session_id = ? AND role = 'assistant'
@@ -680,10 +945,21 @@ def cmd_summary(session_id=None):
         print("No assistant messages in session.")
         return
 
-    # Aggregate progress from ALL assistant messages
+    print(f"=== SESSION SUMMARY ({session_id}) ===\n")
+
+    # Primary: last assistant messages verbatim (the intelligence layer)
+    last_msgs = get_last_assistant_messages(session_id, count=2, max_chars=1500)
+    if last_msgs:
+        print("LAST ASSISTANT MESSAGES (raw):")
+        for msg in last_msgs:
+            print(f"  {msg[:800]}")
+            print()
+        print()
+
+    # Supplemental: regex fallback for structured markers
     all_progress = {"completed": [], "in_progress": [], "next": [], "errors": [], "key_facts": []}
     for msg in asst_msgs:
-        prog = extract_progress(msg)
+        prog = _extract_progress_fallback(msg)
         for key in all_progress:
             all_progress[key].extend(prog[key])
 
@@ -695,18 +971,16 @@ def cmd_summary(session_id=None):
             if item not in seen:
                 seen.add(item)
                 deduped.append(item)
-        all_progress[key] = deduped[:15]  # cap each section
-
-    print(f"=== SESSION SUMMARY ({session_id}) ===\n")
+        all_progress[key] = deduped[:15]
 
     if all_progress["key_facts"]:
-        print("KEY FACTS:")
+        print("KEY FACTS (auto-extracted):")
         for f in all_progress["key_facts"][:8]:
             print(f"  - {f}")
         print()
 
     if all_progress["completed"]:
-        print("COMPLETED:")
+        print("COMPLETED (auto-extracted):")
         for item in all_progress["completed"][:10]:
             print(f"  {item}")
         print()
@@ -716,24 +990,6 @@ def cmd_summary(session_id=None):
         for item in all_progress["errors"][:8]:
             print(f"  {item}")
         print()
-
-    if all_progress["in_progress"]:
-        print("IN PROGRESS (last reported):")
-        for item in all_progress["in_progress"][-5:]:
-            print(f"  {item}")
-        print()
-
-    if all_progress["next"]:
-        print("NEXT / REMAINING:")
-        for item in all_progress["next"][:10]:
-            print(f"  {item}")
-        print()
-
-    # If structured extraction found nothing, fall back to last assistant message tail
-    if not any(all_progress.values()):
-        print("(No structured progress found. Last assistant message:)")
-        last = asst_msgs[-1][-800:]
-        print(last)
 
 
 # ---------------------------------------------------------------------------
@@ -790,21 +1046,28 @@ def cmd_context(include_cron=False):
         print((user_msgs[-1] or "")[:500])
         print()
 
-    # Smart summary instead of raw truncation
+    # v4: Raw assistant messages (primary handoff mechanism)
     if asst_msgs:
-        print("=== SESSION SUMMARY ===")
-        # Aggregate progress
+        print("=== LAST ASSISTANT MESSAGES (raw) ===")
+        last_raw = get_last_assistant_messages(session_id, count=2, max_chars=1500)
+        for msg in last_raw:
+            print(f"  {msg[:800]}")
+            print()
+        print()
+
+    # Supplemental: regex-extracted markers
+    if asst_msgs:
+        print("=== EXTRACTED MARKERS ===")
         all_progress = {"completed": [], "in_progress": [], "next": [], "errors": [], "key_facts": []}
         for msg in asst_msgs:
-            prog = extract_progress(msg)
+            prog = _extract_progress_fallback(msg)
             for key in all_progress:
                 all_progress[key].extend(prog[key])
 
         found_structured = False
-        for key in ["key_facts", "completed", "errors", "in_progress", "next"]:
+        for key in ["key_facts", "completed", "errors"]:
             items = all_progress[key]
             if items:
-                # Deduplicate
                 seen = set()
                 deduped = []
                 for item in items:
@@ -818,11 +1081,8 @@ def cmd_context(include_cron=False):
                     print(f"  {label}:")
                     for item in deduped:
                         print(f"    {item}")
-
         if not found_structured:
-            # Fallback: last assistant message, last 600 chars
-            print("  (No structured markers found. Last message tail:)")
-            print(f"  {(asst_msgs[-1] or '')[-600:]}")
+            print("  (no structured markers found in session)")
         print()
 
     # Detect project paths and show git status
@@ -963,10 +1223,13 @@ def get_context_data(session_id=None, include_cron=False):
     asst_msgs = [r[1] for r in rows if r[0] == "assistant"]
     conn.close()
 
-    # Summary extraction
+    # v4: Primary handoff -- raw last assistant messages (agents interpret, not regex)
+    last_asst_raw = get_last_assistant_messages(sid, count=3, max_chars=2000) if asst_msgs else []
+
+    # Supplemental: regex fallback for structured markers
     summary = {"completed": [], "in_progress": [], "next": [], "errors": [], "key_facts": []}
     for msg in asst_msgs:
-        prog = extract_progress(msg)
+        prog = _extract_progress_fallback(msg)
         for key in summary:
             summary[key].extend(prog[key])
     for key in summary:
@@ -1025,6 +1288,7 @@ def get_context_data(session_id=None, include_cron=False):
         "title": title,
         "what_requested": (user_msgs[0] or "")[:500] if user_msgs else None,
         "last_user_msg": (user_msgs[-1] or "")[:500] if user_msgs and len(user_msgs) > 1 else None,
+        "last_assistant_raw": last_asst_raw,
         "summary": summary,
         "projects": [{
             "root": p.get("git_root"),
@@ -1035,8 +1299,9 @@ def get_context_data(session_id=None, include_cron=False):
         "chain_depth": chain_depth,
         "thrashing": thrashing,
         "thrash_details": thrash_details,
+        "can_continue": check_can_continue(sid),
         "learned_insights": [{"type": t, "observation": o} for t, o in insights],
-        "blockers": [{"message": m, "created": ts} for m, ts in blockers],
+        "blockers": [{"message": m, "created": ts, "age_hours": (time.time() - ts) / 3600 if ts else None} for m, ts in blockers],
     }
 
 
@@ -1095,6 +1360,16 @@ if __name__ == "__main__":
     elif cmd == "should-continue":
         sid = sys.argv[2] if len(sys.argv) > 2 else None
         cmd_should_continue(sid)
+    elif cmd == "check-can-continue":
+        sid = sys.argv[2] if len(sys.argv) > 2 else None
+        result = check_can_continue(sid)
+        print(json.dumps(result, indent=2))
+    elif cmd == "record-git-heads":
+        if len(sys.argv) < 3:
+            print("Usage: carry_forward.py record-git-heads SESSION_ID")
+            sys.exit(1)
+        n = record_git_heads(sys.argv[2])
+        print(f"Recorded git HEADs for {n} projects in session {sys.argv[2]}")
     elif cmd == "learn":
         cmd_learn()
     else:
