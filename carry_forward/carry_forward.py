@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Carry Forward v2 - reads Hermes session history from the SQLite DB.
-Understands git state, session chains, blockers, and extracts real progress.
+Carry Forward v3 - reads Hermes session history from the SQLite DB.
+Understands git state, session chains, blockers, thrash detection, and self-learning.
 
 Usage:
     carry_forward.py context [--include-cron]     # Full context from last session (recommended)
@@ -14,6 +14,8 @@ Usage:
     carry_forward.py blockers                     # Show unresolved blockers
     carry_forward.py block <message>              # Record a blocker
     carry_forward.py unblock <pattern>            # Remove blockers matching pattern
+    carry_forward.py should-continue              # Exit 0 if safe to chain, 1 if thrashing
+    carry_forward.py learn                        # Analyze session history, record patterns
 """
 import sqlite3
 import subprocess
@@ -55,6 +57,21 @@ def get_carry_conn():
             project_dir TEXT,
             created_at REAL NOT NULL
         )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS learned_patterns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern_type TEXT NOT NULL,
+            pattern_key TEXT NOT NULL,
+            observation TEXT NOT NULL,
+            sample_size INTEGER DEFAULT 1,
+            last_seen REAL NOT NULL,
+            created_at REAL NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_patterns_type_key
+        ON learned_patterns(pattern_type, pattern_key)
     """)
     conn.commit()
     return conn
@@ -180,6 +197,247 @@ def cmd_chain(session_id=None):
     if len(chain) >= 10:
         print()
         print("WARNING: Chain depth >= 10. Consider stopping and asking for human input.")
+
+
+# ---------------------------------------------------------------------------
+# Thrash detection
+# ---------------------------------------------------------------------------
+
+def detect_thrash(session_id=None, lookback=5):
+    """
+    Check if recent sessions in the chain are productive.
+    Returns (is_thrashing, dead_count, chain_sessions, details).
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+
+    if not session_id:
+        cur.execute("""
+            SELECT id FROM sessions
+            WHERE message_count > 5 AND source IN ('cli', 'telegram', 'whatsapp')
+            ORDER BY started_at DESC LIMIT 1
+        """)
+        row = cur.fetchone()
+        session_id = row[0] if row else None
+
+    if not session_id:
+        conn.close()
+        return False, 0, [], "no session"
+
+    # Walk the chain backwards, collecting session stats
+    chain_sessions = []
+    current = session_id
+    visited = set()
+    while current and len(chain_sessions) < lookback + 5:
+        if current in visited:
+            break
+        visited.add(current)
+        cur.execute("""
+            SELECT id, parent_session_id, source, message_count, tool_call_count, started_at
+            FROM sessions WHERE id = ?
+        """, (current,))
+        row = cur.fetchone()
+        if not row:
+            break
+        chain_sessions.append({
+            "id": row[0],
+            "parent": row[1],
+            "source": row[2],
+            "msgs": row[3],
+            "tools": row[4],
+            "ts": row[5],
+            "alive": row[3] > 0 or row[4] > 0,
+        })
+        current = row[1]
+
+    conn.close()
+
+    # Count dead sessions (no messages, no tool calls) in the recent chain
+    recent = chain_sessions[:lookback]
+    dead_count = sum(1 for s in recent if not s["alive"])
+
+    # Also check: are there child sessions of this session that are all dead?
+    # (This catches the case where we're the origin of a runaway loop)
+    conn = get_conn()
+    child_count = conn.execute("""
+        SELECT COUNT(*) FROM sessions WHERE parent_session_id = ? AND message_count = 0
+    """, (session_id,)).fetchone()[0]
+    conn.close()
+
+    details = f"chain={len(chain_sessions)} recent_dead={dead_count}/{len(recent)} orphan_children={child_count}"
+
+    # Thrashing if: 3+ of last 5 sessions in chain are dead, OR
+    # this session already has 10+ dead children (runaway loop detection)
+    is_thrashing = dead_count >= 3 or child_count >= 10
+
+    return is_thrashing, dead_count, chain_sessions, details
+
+
+def cmd_should_continue(session_id=None):
+    """
+    Exit code interface for cron scripting.
+    0 = safe to chain, 1 = thrashing / should stop.
+    Also prints human-readable reasoning.
+    """
+    thrashing, dead_count, chain_sessions, details = detect_thrash(session_id)
+
+    if thrashing:
+        print(f"STOP: Thrash detected ({details})")
+        print("Recent sessions produced no output. Do not chain.")
+        sys.exit(1)
+    else:
+        print(f"OK: No thrash detected ({details})")
+        alive = sum(1 for s in chain_sessions[:5] if s["alive"])
+        print(f"  {alive}/5 recent sessions were productive.")
+        sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# Command: learn
+# ---------------------------------------------------------------------------
+
+def cmd_learn():
+    """
+    Analyze the full session history and record patterns about what works.
+    Stores findings in carry_forward.db learned_patterns table.
+    """
+    import time
+    now = time.time()
+    conn = get_conn()
+    cur = conn.cursor()
+
+    carry_conn = get_carry_conn()
+
+    # --- Pattern 1: Continuation success rate by source ---
+    print("Analyzing continuation success rates...")
+    cur.execute("""
+        SELECT s.source,
+               COUNT(*) as total,
+               SUM(CASE WHEN s.tool_call_count > 0 THEN 1 ELSE 0 END) as productive,
+               SUM(CASE WHEN s.tool_call_count = 0 AND s.message_count = 0 THEN 1 ELSE 0 END) as dead
+        FROM sessions s
+        WHERE s.parent_session_id IS NOT NULL
+        GROUP BY s.source
+    """)
+    for source, total, productive, dead in cur.fetchall():
+        productive = productive or 0
+        dead = dead or 0
+        rate = productive / total * 100 if total > 0 else 0
+        obs = f"{rate:.1f}% productive ({productive}/{total}), {dead} dead"
+        carry_conn.execute("""
+            INSERT INTO learned_patterns (pattern_type, pattern_key, observation, sample_size, last_seen, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, ("continuation_rate", source, obs, total, now, now))
+
+    # --- Pattern 2: Session chains that went too deep ---
+    print("Analyzing deep chains...")
+    # Find root sessions that spawned many continuations
+    cur.execute("""
+        SELECT parent_session_id, COUNT(*) as children,
+               SUM(CASE WHEN message_count = 0 AND tool_call_count = 0 THEN 1 ELSE 0 END) as dead_children
+        FROM sessions
+        WHERE parent_session_id IS NOT NULL
+        GROUP BY parent_session_id
+        HAVING children > 5
+        ORDER BY dead_children DESC
+        LIMIT 20
+    """)
+    runaway_count = 0
+    for parent_id, children, dead_children in cur.fetchall():
+        dead_children = dead_children or 0
+        if dead_children > children * 0.8:
+            runaway_count += 1
+    if runaway_count > 0:
+        carry_conn.execute("""
+            INSERT INTO learned_patterns (pattern_type, pattern_key, observation, sample_size, last_seen, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, ("runaway_chains", "total", f"{runaway_count} sessions spawned runaway chains (>80% dead children)", runaway_count, now, now))
+
+    # --- Pattern 3: What session sizes lead to productive continuations? ---
+    print("Analyzing session size vs continuation success...")
+    cur.execute("""
+        SELECT
+            CASE
+                WHEN s1.message_count < 20 THEN 'small'
+                WHEN s1.message_count < 80 THEN 'medium'
+                WHEN s1.message_count < 200 THEN 'large'
+                ELSE 'massive'
+            END as parent_size,
+            COUNT(*) as total,
+            SUM(CASE WHEN s2.tool_call_count > 0 THEN 1 ELSE 0 END) as productive
+        FROM sessions s1
+        JOIN sessions s2 ON s2.parent_session_id = s1.id
+        GROUP BY parent_size
+    """)
+    for size, total, productive in cur.fetchall():
+        productive = productive or 0
+        rate = productive / total * 100 if total > 0 else 0
+        obs = f"Parent sessions of {size} size: {rate:.1f}% of continuations are productive ({productive}/{total})"
+        carry_conn.execute("""
+            INSERT INTO learned_patterns (pattern_type, pattern_key, observation, sample_size, last_seen, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, ("size_success", size, obs, total, now, now))
+
+    # --- Pattern 4: Time-of-day productivity ---
+    print("Analyzing time-of-day patterns...")
+    cur.execute("""
+        SELECT
+            CAST(strftime('%H', s.started_at, 'unixepoch') AS INTEGER) as hour,
+            COUNT(*) as total,
+            SUM(CASE WHEN s.tool_call_count > 10 THEN 1 ELSE 0 END) as productive
+        FROM sessions s
+        WHERE s.message_count > 5
+        GROUP BY hour
+        ORDER BY productive DESC
+    """)
+    hours = cur.fetchall()
+    if hours:
+        best_hours = sorted(hours, key=lambda h: (h[2] or 0) / max(h[1], 1), reverse=True)[:3]
+        worst_hours = sorted(hours, key=lambda h: (h[2] or 0) / max(h[1], 1))[:3]
+        best_str = ", ".join(f"{h[0]:02d}:00 ({(h[2] or 0)}/{h[1]})" for h in best_hours)
+        worst_str = ", ".join(f"{h[0]:02d}:00 ({(h[2] or 0)}/{h[1]})" for h in worst_hours)
+        carry_conn.execute("""
+            INSERT INTO learned_patterns (pattern_type, pattern_key, observation, sample_size, last_seen, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, ("productive_hours", "best", best_str, sum(h[1] for h in hours), now, now))
+        carry_conn.execute("""
+            INSERT INTO learned_patterns (pattern_type, pattern_key, observation, sample_size, last_seen, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, ("productive_hours", "worst", worst_str, sum(h[1] for h in hours), now, now))
+
+    # --- Pattern 5: Overall continuation stats ---
+    print("Computing overall stats...")
+    total_sessions = cur.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    substantial = cur.execute("SELECT COUNT(*) FROM sessions WHERE message_count > 5").fetchone()[0]
+    with_parent = cur.execute("SELECT COUNT(*) FROM sessions WHERE parent_session_id IS NOT NULL").fetchone()[0]
+    dead_continuations = cur.execute("""
+        SELECT COUNT(*) FROM sessions
+        WHERE parent_session_id IS NOT NULL AND message_count = 0 AND tool_call_count = 0
+    """).fetchone()[0]
+
+    carry_conn.execute("""
+        INSERT INTO learned_patterns (pattern_type, pattern_key, observation, sample_size, last_seen, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, ("overview", "stats",
+          f"{total_sessions} total, {substantial} substantial, {with_parent} continuations, {dead_continuations} dead continuations ({dead_continuations/max(with_parent,1)*100:.1f}%)",
+          total_sessions, now, now))
+
+    conn.close()
+
+    # Print summary of what was learned
+    print("\n=== LEARNED PATTERNS ===")
+    rows = carry_conn.execute("""
+        SELECT pattern_type, pattern_key, observation, sample_size
+        FROM learned_patterns
+        WHERE last_seen = ?
+        ORDER BY pattern_type, pattern_key
+    """, (now,)).fetchall()
+    for ptype, pkey, obs, n in rows:
+        print(f"  [{ptype}] {pkey}: {obs} (n={n})")
+
+    carry_conn.commit()
+    carry_conn.close()
+    print(f"\nRecorded {len(rows)} patterns.")
 
 
 # ---------------------------------------------------------------------------
@@ -607,6 +865,32 @@ def cmd_context(include_cron=False):
         if chain_count >= 8:
             print("  WARNING: Deep chain. Consider stopping for human review.")
         print()
+
+    # Thrash detection
+    thrashing, dead_count, _, thrash_details = detect_thrash(session_id)
+    if thrashing or dead_count > 0:
+        print("=== THRASH CHECK ===")
+        if thrashing:
+            print(f"  THRASHING: {thrash_details}")
+            print("  RECOMMENDATION: Do NOT schedule another continuation. Stop for human review.")
+        elif dead_count > 0:
+            print(f"  CAUTION: {dead_count} dead session(s) in recent chain ({thrash_details})")
+        print()
+
+    # Show learned insights relevant to this session
+    carry_conn2 = get_carry_conn()
+    learnings = carry_conn2.execute("""
+        SELECT pattern_type, observation FROM learned_patterns
+        WHERE pattern_type IN ('continuation_rate', 'overview', 'runaway_chains')
+        ORDER BY last_seen DESC LIMIT 5
+    """).fetchall()
+    carry_conn2.close()
+    if learnings:
+        print("=== LEARNED INSIGHTS ===")
+        for ptype, obs in learnings:
+            print(f"  [{ptype}] {obs}")
+        print()
+
     carry_conn.close()
 
     # Show unresolved blockers
@@ -676,6 +960,11 @@ if __name__ == "__main__":
             print("Usage: carry_forward.py unblock <pattern>")
             sys.exit(1)
         cmd_unblock(" ".join(sys.argv[2:]))
+    elif cmd == "should-continue":
+        sid = sys.argv[2] if len(sys.argv) > 2 else None
+        cmd_should_continue(sid)
+    elif cmd == "learn":
+        cmd_learn()
     else:
         print(f"Unknown command: {cmd}")
         print(__doc__)

@@ -1,4 +1,4 @@
-# CARRY FORWARD v2 -- AI Agent Guide
+# CARRY FORWARD v3 -- AI Agent Guide
 
 This document teaches AI agents how to continue work across Hermes sessions.
 
@@ -10,7 +10,7 @@ You may have been told to "load the carry-forward skill" or "read this document 
 
 Hermes sessions are single conversations. When a session ends, everything in it is gone. Carry Forward reads the database of past conversations to figure out what was happening, then picks up where the last session left off.
 
-**v2 adds:** git-aware project state, smart progress extraction, session chain tracking, and persistent blockers -- all in one `context` call.
+**v3 adds:** thrash detection (prevents runaway chains), self-learning from session history, and a `should-continue` exit-code gate for cron scripts.
 
 The database is at `~/.hermes/state.db` (SQLite). Hermes writes every message to it automatically.
 Carry Forward has its own metadata DB at `~/.hermes/carry_forward.db` for blockers and chain metadata.
@@ -186,8 +186,54 @@ All commands use the helper script at:
 | `block MSG` | (none) | Record a new blocker |
 | `blockers` | (none) | Show unresolved blockers |
 | `unblock PATTERN` | (none) | Resolve blockers matching pattern |
+| `should-continue` | `[SESSION_ID]` | Exit 0 if safe to chain, 1 if thrashing |
+| `learn` | (none) | Analyze session history, record patterns |
 
 If SESSION_ID is omitted, commands default to the most recent non-trivial session.
+
+---
+
+## Thrash Detection
+
+Carry Forward v3 automatically detects when a continuation chain is thrashing -- sessions firing but producing no output.
+
+**How it works:**
+- Walks the chain backwards looking for dead sessions (zero messages, zero tool calls)
+- If 3+ of the last 5 sessions in the chain are dead: **THRASHING**
+- If a session already has 10+ dead children (runaway loop): **THRASHING**
+
+**In `context`:** The THRASH CHECK section shows the status automatically.
+
+**For cron scripts:** Use `should-continue` as a gate:
+```bash
+python3 .../carry_forward.py should-continue
+if [ $? -ne 0 ]; then
+    echo "Thrashing detected, aborting"
+    exit 0
+fi
+# ... proceed with work
+```
+
+**Historical data:** Your session history has 86.8% dead continuations (1,738 out of 2,002). The worst case was a single session that spawned 405 empty children. The thrash detector would have stopped that immediately.
+
+---
+
+## Self-Learning
+
+Run `learn` periodically to analyze session history and record patterns:
+
+```
+python3 .../carry_forward.py learn
+```
+
+It discovers:
+- **Continuation success rates** by source (cli/cron/whatsapp)
+- **Runaway chains** -- sessions that spawned >80% dead children
+- **Session size vs success** -- small parent sessions have 40-50% productive continuations; massive ones only 4.7%
+- **Time-of-day productivity** -- which hours produce the most substantial work
+- **Overall stats** -- total sessions, continuation rates, dead session percentage
+
+Learned patterns appear in `context` output under LEARNED INSIGHTS, so every continuation session benefits from the accumulated knowledge.
 
 ---
 
@@ -234,12 +280,12 @@ Metadata DB:     ~/.hermes/carry_forward.db
 
 ---
 
-## What Changed in v2
+## What Changed in v3
 
-If you used carry_forward before, here's what's new:
-- `context` now shows git state, smart summary, chain depth, and blockers (not just raw text)
-- `status` command cross-references sessions with actual git history
-- `summary` command extracts structured progress (completed/errors/next) instead of truncating
-- `chain` command traces the full continuation chain with depth warnings
-- `block/unblock/blockers` commands for persistent blockers that survive across sessions
-- `carry_forward.db` for carry_forward's own metadata (separate from Hermes state.db)
+If you used carry_forward v2 before, here's what's new:
+- **Thrash detection**: Automatically detects dead continuation chains and runaway loops. Warns in `context`, blocks in `should-continue`.
+- **`should-continue`**: Exit-code command for cron scripts. Returns 1 if thrashing detected. Prevents runaway chains before they start.
+- **`learn`**: Analyzes the full 9,000+ session history to discover success/failure patterns. Records findings that appear in every `context` output.
+- **Runaway loop detection**: If a session has 10+ dead children, it's flagged as thrashing regardless of chain state.
+- **Learned insights in context**: Every `context` call now shows relevant learned patterns (continuation rates, size-success correlations, productive hours).
+- **`learned_patterns` table** in carry_forward.db for persistent pattern storage.
