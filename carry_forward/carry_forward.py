@@ -31,6 +31,7 @@ import os
 import json
 import time
 from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
 DB_PATH = "/home/jericho/.hermes/state.db"
 CARRY_DB_PATH = os.path.expanduser("~/.hermes/carry_forward.db")
@@ -39,11 +40,11 @@ CARRY_DB_PATH = os.path.expanduser("~/.hermes/carry_forward.db")
 # DB helpers
 # ---------------------------------------------------------------------------
 
-def get_conn():
+def get_conn() -> sqlite3.Connection:
     return sqlite3.connect(DB_PATH)
 
 
-def get_carry_conn():
+def get_carry_conn() -> sqlite3.Connection:
     """Connect to carry_forward's own metadata DB (creates if needed)."""
     conn = sqlite3.connect(CARRY_DB_PATH)
     conn.execute("""
@@ -152,8 +153,12 @@ DEFAULT_THRESHOLDS = {
 }
 
 
-def get_threshold(key):
-    """Read a threshold from config table, falling back to hardcoded default."""
+def get_threshold(key: str) -> Optional[str]:
+    """Read a threshold from the config table, falling back to DEFAULT_THRESHOLDS.
+
+    Returns None for unknown keys that have no default.
+    Values are always returned as strings.
+    """
     conn = get_carry_conn()
     row = conn.execute("SELECT value FROM config WHERE key = ?", (key,)).fetchone()
     conn.close()
@@ -162,9 +167,14 @@ def get_threshold(key):
     return DEFAULT_THRESHOLDS.get(key)
 
 
-def set_threshold(key, value, source="calibration"):
-    """Write a threshold to the config table."""
-    import time
+def set_threshold(key: str, value: Any, source: str = "calibration") -> None:
+    """Write a threshold to the config table (upsert).
+
+    Args:
+        key: Threshold key (must match a key in DEFAULT_THRESHOLDS for consistency).
+        value: Value to store (converted to str).
+        source: Origin of this value, e.g. 'default', 'calibration', 'manual'.
+    """
     conn = get_carry_conn()
     conn.execute("""
         INSERT INTO config (key, value, source, updated_at)
@@ -179,7 +189,7 @@ def set_threshold(key, value, source="calibration"):
 # Command: last
 # ---------------------------------------------------------------------------
 
-def cmd_last(depth=3, include_cron=False):
+def cmd_last(depth: int = 3, include_cron: bool = False) -> None:
     """Show last N non-trivial sessions."""
     conn = get_conn()
     cur = conn.cursor()
@@ -202,7 +212,7 @@ def cmd_last(depth=3, include_cron=False):
 # Command: last-id
 # ---------------------------------------------------------------------------
 
-def cmd_last_id(include_cron=False):
+def cmd_last_id(include_cron: bool = False) -> None:
     conn = get_conn()
     cur = conn.cursor()
     sources = "('cli', 'telegram', 'whatsapp')" if not include_cron else "('cli', 'telegram', 'whatsapp', 'cron')"
@@ -221,7 +231,7 @@ def cmd_last_id(include_cron=False):
 # Command: messages
 # ---------------------------------------------------------------------------
 
-def cmd_messages(session_id, last_n=20):
+def cmd_messages(session_id: str, last_n: int = 20) -> None:
     """Show messages from a specific session."""
     conn = get_conn()
     cur = conn.cursor()
@@ -243,7 +253,7 @@ def cmd_messages(session_id, last_n=20):
 # Command: chain
 # ---------------------------------------------------------------------------
 
-def cmd_chain(session_id=None):
+def cmd_chain(session_id: Optional[str] = None) -> None:
     """Trace the parent/child continuation chain for a session."""
     conn = get_conn()
     cur = conn.cursor()
@@ -301,7 +311,7 @@ def cmd_chain(session_id=None):
 # Git HEAD tracking for cross-session diff
 # ---------------------------------------------------------------------------
 
-def record_git_heads(session_id):
+def record_git_heads(session_id: str) -> int:
     """Record current git HEAD for all detected projects in a session.
     Called at session start to establish baseline for thrash detection."""
     conn = get_conn()
@@ -317,7 +327,6 @@ def record_git_heads(session_id):
     paths = set(re.findall(r"/home/jericho/[a-zA-Z0-9_/.-]+\.[a-z]{1,4}", all_text))
     dirs = sorted(set(p.rsplit("/", 1)[0] for p in paths))[:10]
 
-    import time
     now = time.time()
     carry_conn = get_carry_conn()
     recorded = 0
@@ -344,7 +353,7 @@ def record_git_heads(session_id):
     return recorded
 
 
-def check_git_progress(session_id, min_sessions=None):
+def check_git_progress(session_id: str, min_sessions: Optional[int] = None) -> Tuple[bool, str]:
     """Check if git HEAD has actually moved across the chain.
     Returns (progress_made, details_str).
     This catches 'busy but unproductive' -- sessions that log work but never commit."""
@@ -413,10 +422,19 @@ def check_git_progress(session_id, min_sessions=None):
 # Thrash detection
 # ---------------------------------------------------------------------------
 
-def detect_thrash(session_id=None, lookback=None):
+def detect_thrash(session_id: Optional[str] = None, lookback: Optional[int] = None) -> Tuple[bool, int, List[Dict[str, Any]], str]:
     """
-    Check if recent sessions in the chain are productive.
-    Returns (is_thrashing, dead_count, chain_sessions, details).
+    Detect whether recent sessions in the continuation chain are productive.
+
+    Walks the parent chain backwards, counting "dead" sessions (0 messages
+    and 0 tool calls). Also checks for orphan child sessions (runaway loop
+    detection).
+
+    Returns:
+        is_thrashing: True if dead_count >= threshold or too many orphan children.
+        dead_count: Number of dead sessions in the recent lookback window.
+        chain_sessions: List of dicts with id, parent, source, msgs, tools, alive.
+        details: Human-readable summary string.
     """
     if lookback is None:
         lookback = int(get_threshold("dead_lookback"))
@@ -494,15 +512,35 @@ def detect_thrash(session_id=None, lookback=None):
     return is_thrashing, dead_count, chain_sessions, details
 
 
-def check_can_continue(session_id=None):
+def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
     """
-    Logic core for continuation decisions. Returns dict:
-      {can_continue, reasons[], thrashing, dead_count, git_progress, blocker_halt, guard_rails}
+    Core decision engine for continuation decisions.
 
-    v5.2: Rewritten decision pipeline. Each check independently gates continuation.
-    Previous version had structural bugs where git_stall forced thrashing=True,
-    killing 188 productive sessions (FN). Now each check is independent and
-    reasons are accumulated correctly.
+    Returns a dict with keys:
+        can_continue (bool): Final go/no-go decision.
+        reasons (list[str]): Halt reasons (empty if continuing).
+        guard_rails (list[str]): Informational warnings (non-blocking).
+        thrashing (bool): Whether the chain is thrashing.
+        dead_count (int): Dead sessions in recent chain.
+        git_progress (str): Git HEAD movement description.
+        blocker_halt (bool): Whether a stale blocker forced halt.
+        session_dead (bool): Whether current session has 0 tools + <=2 msgs.
+        parent_dead (bool): Whether parent session was dead.
+        thrash_details (str): Raw thrash detection details.
+        decision_id (int): Auto-increment ID for outcome tracking.
+
+    v5.2 Decision Pipeline:
+        Each check independently gates continuation:
+        1. Dead session thrash (chain-level, overridden if current session is active)
+        2. Git stalled (informational only -- does NOT force halt)
+        3. Learned pattern guard rails (low continuation rate, large parent)
+        4. Stale blockers (older than blocker_halt_hours = halt)
+        5. Session dead (0 tools AND <=2 msgs = halt)
+        5b. Parent dead + current session also dead = halt
+        6. Git stall + dead session combo (informational)
+
+        Final: can_continue = not thrashing AND not blocker_halt
+               AND not session_dead AND not (parent_dead AND own_tools==0)
     """
     thrashing, dead_count, chain_sessions, details = detect_thrash(session_id)
     git_ok, git_details = check_git_progress(session_id or "")
@@ -598,7 +636,6 @@ def check_can_continue(session_id=None):
     # Check 4: Blocker age threshold
     blocker_halt = False
     BLOCKER_HALT_HOURS = float(get_threshold("blocker_halt_hours"))
-    import time
     now = time.time()
     stale_blockers = carry_conn.execute("""
         SELECT message, created_at FROM blockers
@@ -650,7 +687,6 @@ def check_can_continue(session_id=None):
                     and not (parent_dead and own_tools == 0))
 
     # v5: Log the decision for later outcome tracking
-    import time as _time
     thresholds_used = {k: get_threshold(k) for k in DEFAULT_THRESHOLDS}
     decision_str = "continue" if can_continue else "halt"
     carry_conn2 = get_carry_conn()
@@ -663,7 +699,7 @@ def check_can_continue(session_id=None):
         json.dumps(reasons),
         json.dumps(thresholds_used),
         1 if can_continue else 0,
-        _time.time(),
+        time.time(),
     ))
     decision_id = carry_conn2.execute("SELECT last_insert_rowid()").fetchone()[0]
     carry_conn2.commit()
@@ -684,7 +720,7 @@ def check_can_continue(session_id=None):
     }
 
 
-def cmd_should_continue(session_id=None):
+def cmd_should_continue(session_id: Optional[str] = None) -> None:
     """
     Exit code interface for cron scripting.
     0 = safe to chain, 1 = thrashing / blockers / should stop.
@@ -714,14 +750,22 @@ def cmd_should_continue(session_id=None):
 # v5: Outcome recording
 # ---------------------------------------------------------------------------
 
-def record_outcome(session_id=None):
+def record_outcome(session_id: Optional[str] = None) -> Dict[str, Any]:
     """
-    Check what actually happened after a decision was made for a session.
-    If session_id is None, checks the most recent session with a logged decision.
-    Records the outcome in decision_outcomes table.
-    Returns the outcome dict.
+    Check what actually happened after a continuation decision was made.
+
+    Compares the decision (continue/halt) against the actual session outcome:
+    - Was the session productive (had tool calls)?
+    - Did git HEAD move?
+    - Did the chain continue (child session exists)?
+
+    Records the outcome in decision_outcomes for later calibration.
+    If session_id is None, checks the most recent decision.
+
+    Returns:
+        Dict with decision_id, session_id, decision, and outcome sub-dict.
+        If no decisions are logged, returns {\"error\": \"no decisions logged yet\"}.
     """
-    import time
     now = time.time()
     carry_conn = get_carry_conn()
 
@@ -819,7 +863,7 @@ def record_outcome(session_id=None):
     }
 
 
-def auto_record_outcomes():
+def auto_record_outcomes() -> None:
     """
     Called from context command -- checks if previous session had a logged decision
     and records the outcome if not yet done. Silent, no output.
@@ -839,13 +883,12 @@ def auto_record_outcomes():
 # v5: Calibration
 # ---------------------------------------------------------------------------
 
-def cmd_calibrate():
+def cmd_calibrate() -> None:
     """
     Analyze decision history and find optimal threshold values.
     Sweeps candidate values for each threshold, computes F1 scores,
     and writes the best values to the config table.
     """
-    import time
     now = time.time()
     carry_conn = get_carry_conn()
 
@@ -1055,7 +1098,7 @@ def cmd_calibrate():
     print(f"Calibration complete. {len(rows)} decisions analyzed.")
 
 
-def cmd_show_config():
+def cmd_show_config() -> None:
     """Show current threshold values and their sources."""
     carry_conn = get_carry_conn()
     config_rows = carry_conn.execute("""
@@ -1089,12 +1132,11 @@ def cmd_show_config():
 # Command: learn
 # ---------------------------------------------------------------------------
 
-def cmd_learn():
+def cmd_learn() -> None:
     """
     Analyze the full session history and record patterns about what works.
     Stores findings in carry_forward.db learned_patterns table.
     """
-    import time
     now = time.time()
     conn = get_conn()
     cur = conn.cursor()
@@ -1237,7 +1279,7 @@ def cmd_learn():
 # Command: blockers
 # ---------------------------------------------------------------------------
 
-def cmd_blockers():
+def cmd_blockers() -> None:
     """Show unresolved blockers."""
     conn = get_carry_conn()
     rows = conn.execute("""
@@ -1259,10 +1301,9 @@ def cmd_blockers():
             print(f"         session: {sid}")
 
 
-def cmd_block(message):
+def cmd_block(message: str) -> None:
     """Record a new blocker."""
     conn = get_carry_conn()
-    import time
     # Get last session ID for context
     sconn = get_conn()
     row = sconn.execute("""
@@ -1280,10 +1321,9 @@ def cmd_block(message):
     print(f"Blocked: {message}")
 
 
-def cmd_unblock(pattern):
+def cmd_unblock(pattern: str) -> None:
     """Resolve blockers matching a pattern."""
     conn = get_carry_conn()
-    import time
     rows = conn.execute("""
         SELECT id, message FROM blockers WHERE resolved_at IS NULL AND message LIKE ?
     """, (f"%{pattern}%",)).fetchall()
@@ -1305,7 +1345,7 @@ def cmd_unblock(pattern):
 # Git-aware project state
 # ---------------------------------------------------------------------------
 
-def git_status(project_dir):
+def git_status(project_dir: str) -> Dict[str, Any]:
     """Run git commands in a project dir and return structured state."""
     result = {"dir": project_dir, "branch": None, "last_commits": [], "dirty": False, "error": None}
 
@@ -1347,7 +1387,7 @@ def git_status(project_dir):
     return result
 
 
-def cmd_status(session_id=None):
+def cmd_status(session_id: Optional[str] = None) -> None:
     """Show git-aware project state for projects detected from a session."""
     conn = get_conn()
     cur = conn.cursor()
@@ -1404,7 +1444,7 @@ def cmd_status(session_id=None):
 # Smart summary extraction
 # ---------------------------------------------------------------------------
 
-def _extract_progress_fallback(text):
+def _extract_progress_fallback(text: str) -> Dict[str, Any]:
     """Fallback regex extraction for sessions without structured markers.
     Only used when no agent-written summary is available."""
     lines = text.split("\n")
@@ -1442,7 +1482,7 @@ def _extract_progress_fallback(text):
     return results
 
 
-def get_last_assistant_messages(session_id, count=3, max_chars=2000):
+def get_last_assistant_messages(session_id: str, count: int = 3, max_chars: int = 2000) -> List[str]:
     """Get the last N assistant messages verbatim. This is the primary
     handoff mechanism -- agents interpret, carry_forward transports."""
     conn = get_conn()
@@ -1471,7 +1511,7 @@ def get_last_assistant_messages(session_id, count=3, max_chars=2000):
     return result
 
 
-def cmd_summary(session_id=None):
+def cmd_summary(session_id: Optional[str] = None) -> None:
     """Smart summary of session progress. Primary: raw assistant messages.
     Fallback: regex extraction if no messages available."""
     conn = get_conn()
@@ -1555,7 +1595,7 @@ def cmd_summary(session_id=None):
 # Command: context (the main one - integrates everything)
 # ---------------------------------------------------------------------------
 
-def cmd_context(include_cron=False):
+def cmd_context(include_cron: bool = False) -> None:
     """Full context from last session, with git state, summary, chain, and blockers."""
     # v5: Auto-record outcome from previous session before showing context
     auto_record_outcomes()
@@ -1738,7 +1778,7 @@ def cmd_context(include_cron=False):
 # Library API (for import by session_chain and other tools)
 # ---------------------------------------------------------------------------
 
-def get_context_data(session_id=None, include_cron=False):
+def get_context_data(session_id: Optional[str] = None, include_cron: bool = False) -> Dict[str, Any]:
     """
     Programmatic version of cmd_context(). Returns a dict with:
       session_id, title, what_requested, last_user_msg,

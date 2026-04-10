@@ -3,189 +3,16 @@
 Uses temporary SQLite databases to avoid touching real state.
 Mocks get_conn() and get_carry_conn() to point to test DBs.
 """
-import pytest
-import sqlite3
 import os
+import sqlite3
 import sys
-import tempfile
-from unittest.mock import patch
-from datetime import datetime
+import time
 
-# Ensure carry_forward module is importable
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+import pytest
 
-
-# ---------------------------------------------------------------------------
-# Fixtures: temp databases
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-def state_db(tmp_path):
-    """Create a temporary state.db with the sessions table."""
-    db_path = str(tmp_path / "state.db")
-    conn = sqlite3.connect(db_path)
-    conn.execute("""
-        CREATE TABLE sessions (
-            id TEXT PRIMARY KEY,
-            parent_session_id TEXT,
-            source TEXT,
-            message_count INTEGER DEFAULT 0,
-            tool_call_count INTEGER DEFAULT 0,
-            started_at REAL,
-            model TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT,
-            role TEXT,
-            content TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-    return db_path
-
-
-@pytest.fixture
-def carry_db(tmp_path):
-    """Create a temporary carry_forward.db with all required tables."""
-    db_path = str(tmp_path / "carry_forward.db")
-    conn = sqlite3.connect(db_path)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS blockers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT,
-            message TEXT NOT NULL,
-            created_at REAL NOT NULL,
-            resolved_at REAL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS chain_meta (
-            session_id TEXT PRIMARY KEY,
-            parent_session_id TEXT,
-            continuation_count INTEGER DEFAULT 0,
-            outcome TEXT,
-            project_dir TEXT,
-            created_at REAL NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS learned_patterns (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            pattern_type TEXT NOT NULL,
-            pattern_key TEXT NOT NULL,
-            observation TEXT NOT NULL,
-            sample_size INTEGER DEFAULT 1,
-            last_seen REAL NOT NULL,
-            created_at REAL NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS chain_git_heads (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            project_dir TEXT NOT NULL,
-            git_head TEXT NOT NULL,
-            recorded_at REAL NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS decision_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT,
-            decision TEXT NOT NULL,
-            reasons_json TEXT,
-            thresholds_json TEXT,
-            can_continue INTEGER NOT NULL,
-            created_at REAL NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS decision_outcomes (
-            decision_id INTEGER PRIMARY KEY,
-            session_id TEXT NOT NULL,
-            outcome_productive INTEGER,
-            outcome_git_moved INTEGER,
-            outcome_chain_continued INTEGER,
-            outcome_tool_calls INTEGER DEFAULT 0,
-            outcome_message_count INTEGER DEFAULT 0,
-            checked_at REAL NOT NULL,
-            FOREIGN KEY (decision_id) REFERENCES decision_log(id)
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS config (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            source TEXT NOT NULL DEFAULT 'default',
-            updated_at REAL NOT NULL
-        )
-    """)
-    conn.commit()
-    conn.close()
-    return db_path
-
-
-@pytest.fixture
-def patched_env(state_db, carry_db):
-    """Patch get_conn and get_carry_conn to use temp databases."""
-    import carry_forward as cf
-    with patch.object(cf, 'DB_PATH', state_db), \
-         patch.object(cf, 'CARRY_DB_PATH', carry_db), \
-         patch.object(cf, 'get_conn', lambda: sqlite3.connect(state_db)), \
-         patch.object(cf, 'get_carry_conn', lambda: sqlite3.connect(carry_db)):
-        yield cf
-
-
-def insert_session(state_db, sid, parent=None, source='cli', msgs=0, tools=0):
-    """Helper to insert a session into state.db."""
-    conn = sqlite3.connect(state_db)
-    conn.execute(
-        "INSERT INTO sessions (id, parent_session_id, source, message_count, tool_call_count, started_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (sid, parent, source, msgs, tools, datetime.now().timestamp())
-    )
-    conn.commit()
-    conn.close()
-
-
-def insert_blocker(carry_db, message, age_hours=5, resolved=False):
-    """Helper to insert a blocker."""
-    conn = sqlite3.connect(carry_db)
-    import time
-    ts = time.time() - (age_hours * 3600)
-    conn.execute(
-        "INSERT INTO blockers (session_id, message, created_at, resolved_at) VALUES (?, ?, ?, ?)",
-        ("test_session", message, ts, time.time() if resolved else None)
-    )
-    conn.commit()
-    conn.close()
-
-
-def insert_git_heads(carry_db, session_id, project_dir, git_head):
-    """Helper to insert git head snapshots."""
-    conn = sqlite3.connect(carry_db)
-    import time
-    conn.execute(
-        "INSERT INTO chain_git_heads (session_id, project_dir, git_head, recorded_at) VALUES (?, ?, ?, ?)",
-        (session_id, project_dir, git_head, time.time())
-    )
-    conn.commit()
-    conn.close()
-
-
-def insert_config(carry_db, key, value, source='default'):
-    """Helper to set a config value."""
-    import time
-    conn = sqlite3.connect(carry_db)
-    conn.execute(
-        "INSERT INTO config (key, value, source, updated_at) VALUES (?, ?, ?, ?)",
-        (key, str(value), source, time.time())
-    )
-    conn.commit()
-    conn.close()
+# Ensure conftest helpers are importable
+sys.path.insert(0, os.path.dirname(__file__))
+from conftest import insert_session, insert_blocker, insert_git_heads, insert_config, insert_chain  # noqa: E402
 
 
 # ===========================================================================
@@ -220,7 +47,6 @@ class TestCheckCanContinue:
         """Session with 0 tools but 3+ messages is not dead (>2 threshold)."""
         insert_session(state_db, "msgs_3", msgs=3, tools=0)
         result = patched_env.check_can_continue("msgs_3")
-        # Not dead (msgs > 2), not thrashing (only 1 session)
         assert result["can_continue"] is True
         assert result["session_dead"] is False
 
@@ -272,19 +98,16 @@ class TestCheckCanContinue:
 
     def test_thrashing_active_session_continues(self, state_db, carry_db, patched_env):
         """Active session should continue even in a thrashing chain."""
-        # Set low thresholds to trigger thrashing
         insert_config(carry_db, "dead_session_threshold", "1")
         insert_config(carry_db, "dead_lookback", "3")
         insert_config(carry_db, "orphan_child_threshold", "10")
 
-        # Create chain: grandparent -> parent(dead) -> current(active)
         insert_session(state_db, "gp_1", msgs=5, tools=2)
         insert_session(state_db, "p_dead", parent="gp_1", msgs=0, tools=0)
         insert_session(state_db, "active_in_thrash", parent="p_dead", msgs=20, tools=15)
 
         result = patched_env.check_can_continue("active_in_thrash")
         assert result["can_continue"] is True
-        # Thrash should be overridden
         assert result["thrashing"] is False
 
     def test_thrashing_dead_session_halts(self, state_db, carry_db, patched_env):
@@ -302,7 +125,6 @@ class TestCheckCanContinue:
     def test_no_session_id_resolves(self, state_db, carry_db, patched_env):
         """When no session_id given, should resolve to latest session."""
         insert_session(state_db, "old_one", msgs=5, tools=2, source='cli')
-        import time
         conn = sqlite3.connect(state_db)
         conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?",
                      (time.time() - 100, "old_one"))
@@ -323,19 +145,15 @@ class TestCheckCanContinue:
         """Git stalled but session has tools -> should continue (v5.2 fix)."""
         insert_config(carry_db, "git_min_sessions", "2")
 
-        # Create chain of 3 sessions
         insert_session(state_db, "g1", msgs=5, tools=2)
         insert_session(state_db, "g2", parent="g1", msgs=5, tools=2)
         insert_session(state_db, "g3", parent="g2", msgs=10, tools=8)
 
-        # Same git head at start and end = stalled
         insert_git_heads(carry_db, "g1", "/project", "abc123")
         insert_git_heads(carry_db, "g3", "/project", "abc123")
 
         result = patched_env.check_can_continue("g3")
-        # v5.2: git stall does NOT force halt
         assert result["can_continue"] is True
-        # Should note git stall in guard_rails
         assert any("Git stalled" in gr for gr in result["guard_rails"])
 
     def test_returns_decision_id(self, state_db, carry_db, patched_env):
@@ -417,7 +235,7 @@ class TestDetectThrash:
         insert_session(state_db, "mix3", parent="mix2", msgs=10, tools=5)
 
         thrashing, dead_count, chain, details = patched_env.detect_thrash("mix3")
-        assert dead_count < 3  # Only 1 dead in the chain
+        assert dead_count < 3
 
 
 # ===========================================================================
@@ -428,7 +246,6 @@ class TestBlockers:
     def test_block_and_list(self, carry_db, patched_env):
         """block() should create a blocker in the DB."""
         patched_env.cmd_block("test blocker reason")
-        import sqlite3
         conn = sqlite3.connect(carry_db)
         row = conn.execute("SELECT COUNT(*) FROM blockers WHERE message LIKE '%test blocker reason%'").fetchone()
         conn.close()
@@ -438,7 +255,6 @@ class TestBlockers:
         """unblock() should resolve matching blockers."""
         patched_env.cmd_block("will be removed")
         patched_env.cmd_unblock("will be removed")
-        import sqlite3
         conn = sqlite3.connect(carry_db)
         row = conn.execute("SELECT COUNT(*) FROM blockers WHERE message LIKE '%will be removed%' AND resolved_at IS NULL").fetchone()
         conn.close()
@@ -462,7 +278,7 @@ class TestGitProgress:
         insert_session(state_db, "gh2", parent="gh1", msgs=5, tools=2)
         insert_session(state_db, "gh3", parent="gh2", msgs=5, tools=2)
         ok, details = patched_env.check_git_progress("gh3")
-        assert ok is True  # no heads recorded = first run
+        assert ok is True
 
     def test_git_moved_passes(self, state_db, carry_db, patched_env):
         """Different git HEADs across chain should pass."""
@@ -500,19 +316,13 @@ class TestRecordOutcome:
     def test_record_outcome_for_productive(self, state_db, carry_db, patched_env):
         """Should record productive outcome for a session with tool calls."""
         insert_session(state_db, "prod_1", msgs=10, tools=5)
-
-        # First, make a decision
         result = patched_env.check_can_continue("prod_1")
-        dec_id = result["decision_id"]
-
-        # Record outcome
         outcome = patched_env.record_outcome("prod_1")
         assert outcome["outcome"]["productive"] is True
 
     def test_record_outcome_for_unproductive(self, state_db, carry_db, patched_env):
         """Should record unproductive outcome for a session with no tool calls."""
         insert_session(state_db, "unprod_1", msgs=1, tools=0)
-
         result = patched_env.check_can_continue("unprod_1")
         outcome = patched_env.record_outcome("unprod_1")
         assert outcome["outcome"]["productive"] is False
@@ -536,3 +346,99 @@ class TestShouldContinue:
         with pytest.raises(SystemExit) as exc_info:
             patched_env.cmd_should_continue("sc_dead")
         assert exc_info.value.code == 1
+
+
+# ===========================================================================
+# Tests: Edge cases (empty DB, missing session, long chains)
+# ===========================================================================
+
+class TestEdgeCases:
+    """Edge cases and boundary conditions."""
+
+    def test_empty_db_no_crash(self, state_db, carry_db, patched_env):
+        """check_can_continue should not crash on empty DB."""
+        result = patched_env.check_can_continue()
+        assert "can_continue" in result
+
+    def test_missing_session_id(self, state_db, carry_db, patched_env):
+        """Non-existent session_id should not crash."""
+        result = patched_env.check_can_continue("does_not_exist")
+        assert "can_continue" in result
+        assert result["can_continue"] is False
+        assert result["session_dead"] is True
+
+    def test_very_long_chain(self, state_db, carry_db, patched_env):
+        """A chain of 50 sessions should not crash."""
+        ids = insert_chain(state_db, 50, alive=True)
+        last_id = ids[-1]
+        result = patched_env.check_can_continue(last_id)
+        assert result["can_continue"] is True
+
+    def test_very_long_dead_chain(self, state_db, carry_db, patched_env):
+        """A long dead chain should detect thrash."""
+        insert_config(carry_db, "dead_session_threshold", "3")
+        insert_config(carry_db, "dead_lookback", "10")
+
+        ids = insert_chain(state_db, 20, alive=False)
+        last_id = ids[-1]
+        result = patched_env.check_can_continue(last_id)
+        assert result["can_continue"] is False
+
+    def test_chain_with_cycle(self, state_db, carry_db, patched_env):
+        """Circular parent reference should not infinite-loop."""
+        insert_session(state_db, "cyc_a", parent="cyc_b", msgs=10, tools=5)
+        insert_session(state_db, "cyc_b", parent="cyc_a", msgs=10, tools=5)
+        result = patched_env.check_can_continue("cyc_a")
+        assert "can_continue" in result
+
+    def test_multiple_blockers_oldest_halts(self, state_db, carry_db, patched_env):
+        """Multiple blockers where at least one is stale should halt."""
+        insert_session(state_db, "multi_block", msgs=10, tools=5)
+        insert_blocker(carry_db, "recent blocker", age_hours=0.5)
+        insert_blocker(carry_db, "stale blocker", age_hours=8)
+        result = patched_env.check_can_continue("multi_block")
+        assert result["can_continue"] is False
+        assert result["blocker_halt"] is True
+
+    def test_zero_tools_many_msgs_continues(self, state_db, carry_db, patched_env):
+        """Session with 0 tools but 100 msgs should continue (likely read-only)."""
+        insert_session(state_db, "many_msgs", msgs=100, tools=0)
+        result = patched_env.check_can_continue("many_msgs")
+        assert result["can_continue"] is True
+        assert result["session_dead"] is False
+
+    def test_check_git_progress_missing_session(self, state_db, carry_db, patched_env):
+        """check_git_progress with non-existent session should not crash."""
+        ok, details = patched_env.check_git_progress("nonexistent")
+        assert ok is True  # Can't walk chain -> short chain
+
+    def test_record_outcome_no_decisions(self, state_db, carry_db, patched_env):
+        """record_outcome with no logged decisions should return error."""
+        result = patched_env.record_outcome()
+        assert "error" in result
+
+    def test_detect_thrash_no_session(self, state_db, carry_db, patched_env):
+        """detect_thrash with no sessions should return safe."""
+        thrashing, dead_count, chain, details = patched_env.detect_thrash()
+        assert thrashing is False
+        assert dead_count == 0
+
+    def test_config_persistence(self, carry_db, patched_env):
+        """Config values should persist across get/set cycles."""
+        patched_env.set_threshold("test_key", "42", source="test")
+        assert patched_env.get_threshold("test_key") == "42"
+        patched_env.set_threshold("test_key", "99", source="test2")
+        assert patched_env.get_threshold("test_key") == "99"
+
+    def test_chain_exactly_at_threshold(self, state_db, carry_db, patched_env):
+        """Chain with exactly threshold dead sessions should trigger."""
+        insert_config(carry_db, "dead_session_threshold", "3")
+        insert_config(carry_db, "dead_lookback", "3")
+
+        insert_session(state_db, "t1", msgs=0, tools=0)
+        insert_session(state_db, "t2", parent="t1", msgs=0, tools=0)
+        insert_session(state_db, "t3", parent="t2", msgs=0, tools=0)
+
+        thrashing, dead_count, chain, details = patched_env.detect_thrash("t3")
+        assert dead_count == 3
+        assert thrashing is True

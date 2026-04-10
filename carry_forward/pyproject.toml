@@ -1,0 +1,22 @@
+[project]
+name = "carry-forward"
+version = "5.2.0"
+description = "Self-tuning intelligence layer for Hermes session continuity"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "mypy>=1.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+files = ["carry_forward.py"]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
