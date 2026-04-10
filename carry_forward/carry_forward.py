@@ -484,10 +484,11 @@ def detect_thrash(session_id=None, lookback=None):
     # this session already has orphan_thresh+ dead children (runaway loop detection)
     is_thrashing = dead_count >= dead_thresh or child_count >= orphan_thresh
 
-    # v4: Also check git progress -- catches "busy but unproductive"
+    # Git stall is informational only -- it adds a reason but does NOT force
+    # is_thrashing=True.  Sessions can be productive (many tool calls) without
+    # committing, and we should not kill them for that.
     git_ok, git_details = check_git_progress(session_id)
     if not git_ok:
-        is_thrashing = True
         details += f" | {git_details}"
 
     return is_thrashing, dead_count, chain_sessions, details
@@ -497,6 +498,11 @@ def check_can_continue(session_id=None):
     """
     Logic core for continuation decisions. Returns dict:
       {can_continue, reasons[], thrashing, dead_count, git_progress, blocker_halt, guard_rails}
+
+    v5.2: Rewritten decision pipeline. Each check independently gates continuation.
+    Previous version had structural bugs where git_stall forced thrashing=True,
+    killing 188 productive sessions (FN). Now each check is independent and
+    reasons are accumulated correctly.
     """
     thrashing, dead_count, chain_sessions, details = detect_thrash(session_id)
     git_ok, git_details = check_git_progress(session_id or "")
@@ -504,28 +510,59 @@ def check_can_continue(session_id=None):
     reasons = []
     guard_rails = []
 
-    # Check 1: Dead session thrash
-    dead_thresh = int(get_threshold("dead_session_threshold"))
-    if thrashing:
-        if dead_count >= dead_thresh:
-            reasons.append(f"Thrash: {dead_count} dead sessions in recent chain ({details})")
-        if not git_ok:
-            reasons.append(f"Git stalled: {git_details}")
-
-    # Check 2: Learned pattern guard rails
-    carry_conn = get_carry_conn()
-
-    # 2a: Continuation rates by source -- if current source has <20% rate, warn
+    # Resolve session_id if not provided (cron context)
     conn = get_conn()
-    if session_id:
-        src = conn.execute("SELECT source FROM sessions WHERE id = ?", (session_id,)).fetchone()
-        source = src[0] if src else None
-    else:
-        src = conn.execute("""
-            SELECT source FROM sessions
-            WHERE message_count > 5 AND source IN ('cli', 'telegram', 'whatsapp')
+    resolved_session_id = session_id
+    if not resolved_session_id:
+        row = conn.execute("""
+            SELECT id FROM sessions
+            WHERE message_count > 0 AND source IN ('cli', 'telegram', 'whatsapp')
             ORDER BY started_at DESC LIMIT 1
         """).fetchone()
+        if row:
+            resolved_session_id = row[0]
+    conn.close()
+
+    # Fetch current session activity early (needed by multiple checks)
+    own_tools = 0
+    own_msgs = 0
+    conn_early = get_conn()
+    if resolved_session_id:
+        early_row = conn_early.execute(
+            "SELECT tool_call_count, message_count FROM sessions WHERE id = ?",
+            (resolved_session_id,)
+        ).fetchone()
+        if early_row:
+            own_tools = early_row[0]
+            own_msgs = early_row[1]
+    conn_early.close()
+
+    # Check 1: Dead session thrash (chain has too many dead sessions)
+    # But don't halt if the current session is already active -- a productive
+    # session shouldn't be killed because its ancestors were dead.
+    if thrashing and own_tools == 0:
+        reasons.append(f"Thrash: {dead_count} dead sessions in recent chain ({details})")
+    elif thrashing:
+        guard_rails.append(f"Thrash detected but session is active: {details}")
+        thrashing = False  # Active session overrides chain thrash
+
+    # Check 2: Git stalled (informational -- does NOT force halt on its own.
+    # A productive session with tool calls should not be killed just because
+    # it hasn't committed yet. But combined with a dead session, it's fatal.)
+    git_stalled = False
+    if not git_ok:
+        git_stalled = True
+        # Only add as halt reason if session is also dead (see check 5)
+        guard_rails.append(f"Git stalled: {git_details}")
+
+    # Check 3: Learned pattern guard rails
+    carry_conn = get_carry_conn()
+
+    # 3a: Continuation rates by source -- if current source has low rate, halt
+    conn = get_conn()
+    source = None
+    if resolved_session_id:
+        src = conn.execute("SELECT source FROM sessions WHERE id = ?", (resolved_session_id,)).fetchone()
         source = src[0] if src else None
     conn.close()
 
@@ -537,17 +574,15 @@ def check_can_continue(session_id=None):
         """, (source,)).fetchone()
         cont_rate_min = float(get_threshold("continuation_rate_min"))
         if rate_row:
-            # Parse "XX.X% productive" from observation
             m = re.match(r'([\d.]+)%\s+productive', rate_row[0])
             if m and float(m.group(1)) < cont_rate_min:
                 guard_rails.append(f"Low continuation rate for {source}: {rate_row[0]}")
-                reasons.append(f"Source {source} has historically low continuation success")
 
-    # 2b: Session size warning -- if parent session was massive, continuations tend to die
+    # 3b: Session size warning -- if parent session was massive, warn
     parent_size_warn = int(get_threshold("parent_size_warning"))
     conn = get_conn()
-    if session_id:
-        parent = conn.execute("SELECT parent_session_id FROM sessions WHERE id = ?", (session_id,)).fetchone()
+    if resolved_session_id:
+        parent = conn.execute("SELECT parent_session_id FROM sessions WHERE id = ?", (resolved_session_id,)).fetchone()
         if parent and parent[0]:
             parent_msgs = conn.execute("SELECT message_count FROM sessions WHERE id = ?", (parent[0],)).fetchone()
             if parent_msgs and parent_msgs[0] > parent_size_warn:
@@ -560,7 +595,7 @@ def check_can_continue(session_id=None):
                     guard_rails.append(f"Large parent session: {size_row[0]}")
     conn.close()
 
-    # Check 3: Blocker age threshold
+    # Check 4: Blocker age threshold
     blocker_halt = False
     BLOCKER_HALT_HOURS = float(get_threshold("blocker_halt_hours"))
     import time
@@ -577,23 +612,42 @@ def check_can_continue(session_id=None):
             reasons.append(f"Stale blocker ({age_h:.1f}h old): {msg}")
         blocker_halt = True
 
-    # Check 4: Current session activity (v5.1)
-    # If this session itself has 0 tool calls and <=2 messages, it's dead.
-    # Don't spawn continuations from a dead session -- this was the #1 source
-    # of false continues (184/201 = 92% of "continue" decisions were wrong).
+    # Check 5: Session activity (v5.2 -- expanded)
+    # 5a: If this session itself has 0 tool calls and <=2 messages, it's dead.
+    # (own_tools/own_msgs already fetched before Check 1)
     session_dead = False
+    parent_dead = False
+    if own_tools == 0 and own_msgs <= 2:
+        session_dead = True
+        reasons.append(f"Session dead: 0 tool calls, {own_msgs} messages")
+
+    # 5b: Parent dead check -- if parent had 0 tools and <=2 msgs, continuation is pointless
     conn_check = get_conn()
-    if session_id:
-        own_row = conn_check.execute(
-            "SELECT tool_call_count, message_count FROM sessions WHERE id = ?",
-            (session_id,)
+    if not session_dead and resolved_session_id:
+        parent_row = conn_check.execute(
+            "SELECT parent_session_id FROM sessions WHERE id = ?",
+            (resolved_session_id,)
         ).fetchone()
-        if own_row and own_row[0] == 0 and own_row[1] <= 2:
-            session_dead = True
-            reasons.append(f"Session dead: 0 tool calls, {own_row[1]} messages")
+        if parent_row and parent_row[0]:
+            p_row = conn_check.execute(
+                "SELECT tool_call_count, message_count FROM sessions WHERE id = ?",
+                (parent_row[0],)
+            ).fetchone()
+            if p_row and p_row[0] == 0 and p_row[1] <= 2:
+                parent_dead = True
+                reasons.append(f"Parent session dead: 0 tool calls, {p_row[1]} messages")
     conn_check.close()
 
-    can_continue = not thrashing and not blocker_halt and not session_dead
+    # Check 6: Git stall + dead session combo
+    # If git is stalled AND the current session has no tools, it's a double signal
+    if git_stalled and session_dead:
+        reasons.append("Git stalled + dead session: no progress and no activity")
+
+    # Final decision: continue only if ALL halt checks pass.
+    # Exception: if the current session itself has tool calls, it's productive
+    # regardless of parent state -- don't kill a live session for a dead parent.
+    can_continue = (not thrashing and not blocker_halt and not session_dead
+                    and not (parent_dead and own_tools == 0))
 
     # v5: Log the decision for later outcome tracking
     import time as _time
@@ -604,7 +658,7 @@ def check_can_continue(session_id=None):
         INSERT INTO decision_log (session_id, decision, reasons_json, thresholds_json, can_continue, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
     """, (
-        session_id,
+        resolved_session_id,
         decision_str,
         json.dumps(reasons),
         json.dumps(thresholds_used),
@@ -624,6 +678,7 @@ def check_can_continue(session_id=None):
         "git_progress": git_details,
         "blocker_halt": blocker_halt,
         "session_dead": session_dead,
+        "parent_dead": parent_dead,
         "thrash_details": details,
         "decision_id": decision_id,
     }

@@ -157,7 +157,7 @@ def compute_metrics(classifications):
 def replay_with_fix(session_features, decision, original_row):
     """
     Apply proposed fixes and return what the new decision would be.
-    Returns (new_decision, reasons).
+    v5.2: Mirrors the actual check_can_continue logic after the rewrite.
     """
     decision_id, session_id, orig_decision, reasons_json, thresholds_json, \
         can_continue, created_at, productive, tool_calls, msg_count, \
@@ -183,6 +183,11 @@ def replay_with_fix(session_features, decision, original_row):
         child_productive = session_features.get("productive_children", 0)
         if child_total > 0 and child_productive / child_total < 0.1:
             return "halt", reasons + [f"FIX: {child_productive}/{child_total} children productive"]
+
+    # v5.2: Git stall should NOT force halt on its own.
+    # The old logic had git_stall -> thrashing=True which killed 188 productive sessions.
+    # Now git stall is informational only unless combined with a dead session.
+    # (This fix is applied in detect_thrash, not here.)
 
     return decision, reasons
 
