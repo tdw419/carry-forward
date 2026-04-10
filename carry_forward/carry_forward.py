@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Carry Forward v4 - intelligence layer for Hermes session continuity.
+Carry Forward v5 - self-tuning intelligence layer for Hermes session continuity.
 Transport, not comprehension. Packages what happened; agents do the interpretation.
+v5: Decisions are logged, outcomes are tracked, thresholds are calibrated from data.
 
 Usage:
     carry_forward.py context [--include-cron]     # Full context from last session (recommended)
@@ -18,6 +19,9 @@ Usage:
     carry_forward.py check-can-continue [SESSION] # JSON: full continuation decision
     carry_forward.py record-git-heads SESSION_ID  # Snapshot git HEADs for thrash detection
     carry_forward.py learn                        # Analyze session history, record patterns
+    carry_forward.py record-outcome [SESSION_ID]  # Record outcome of a past decision
+    carry_forward.py calibrate                    # Auto-tune thresholds from decision history
+    carry_forward.py show-config                  # Show current threshold values
 """
 import sqlite3
 import subprocess
@@ -89,8 +93,86 @@ def get_carry_conn():
         CREATE INDEX IF NOT EXISTS idx_chain_git_session
         ON chain_git_heads(session_id)
     """)
+    # v5: Decision logging -- every check_can_continue call gets recorded
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS decision_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            decision TEXT NOT NULL,
+            reasons_json TEXT,
+            thresholds_json TEXT,
+            can_continue INTEGER NOT NULL,
+            created_at REAL NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_decision_session
+        ON decision_log(session_id)
+    """)
+    # v5: Outcome tracking -- what actually happened after a decision
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS decision_outcomes (
+            decision_id INTEGER PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            outcome_productive INTEGER,
+            outcome_git_moved INTEGER,
+            outcome_chain_continued INTEGER,
+            outcome_tool_calls INTEGER DEFAULT 0,
+            outcome_message_count INTEGER DEFAULT 0,
+            checked_at REAL NOT NULL,
+            FOREIGN KEY (decision_id) REFERENCES decision_log(id)
+        )
+    """)
+    # v5: Tunable config -- thresholds read from here instead of hardcoded
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'default',
+            updated_at REAL NOT NULL
+        )
+    """)
     conn.commit()
     return conn
+
+
+# ---------------------------------------------------------------------------
+# v5: Tunable thresholds
+# ---------------------------------------------------------------------------
+
+DEFAULT_THRESHOLDS = {
+    "dead_session_threshold": "3",       # dead_count >= this => thrashing
+    "dead_lookback": "5",                # how many recent sessions to check
+    "orphan_child_threshold": "10",      # dead children >= this => runaway
+    "continuation_rate_min": "15",       # source rate < this% => halt
+    "blocker_halt_hours": "4",           # blocker age > this => halt
+    "git_min_sessions": "3",             # chain length for git progress check
+    "parent_size_warning": "200",        # parent msg count > this => warning
+    "chain_depth_warning": "8",          # chain depth >= this => warning
+}
+
+
+def get_threshold(key):
+    """Read a threshold from config table, falling back to hardcoded default."""
+    conn = get_carry_conn()
+    row = conn.execute("SELECT value FROM config WHERE key = ?", (key,)).fetchone()
+    conn.close()
+    if row:
+        return row[0]
+    return DEFAULT_THRESHOLDS.get(key)
+
+
+def set_threshold(key, value, source="calibration"):
+    """Write a threshold to the config table."""
+    import time
+    conn = get_carry_conn()
+    conn.execute("""
+        INSERT INTO config (key, value, source, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=?, source=?, updated_at=?
+    """, (key, str(value), source, time.time(), str(value), source, time.time()))
+    conn.commit()
+    conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -262,10 +344,12 @@ def record_git_heads(session_id):
     return recorded
 
 
-def check_git_progress(session_id, min_sessions=3):
+def check_git_progress(session_id, min_sessions=None):
     """Check if git HEAD has actually moved across the chain.
     Returns (progress_made, details_str).
     This catches 'busy but unproductive' -- sessions that log work but never commit."""
+    if min_sessions is None:
+        min_sessions = int(get_threshold("git_min_sessions"))
     # Walk the chain to find the oldest session with recorded git heads
     conn = get_conn()
     cur = conn.cursor()
@@ -329,11 +413,15 @@ def check_git_progress(session_id, min_sessions=3):
 # Thrash detection
 # ---------------------------------------------------------------------------
 
-def detect_thrash(session_id=None, lookback=5):
+def detect_thrash(session_id=None, lookback=None):
     """
     Check if recent sessions in the chain are productive.
     Returns (is_thrashing, dead_count, chain_sessions, details).
     """
+    if lookback is None:
+        lookback = int(get_threshold("dead_lookback"))
+    dead_thresh = int(get_threshold("dead_session_threshold"))
+    orphan_thresh = int(get_threshold("orphan_child_threshold"))
     conn = get_conn()
     cur = conn.cursor()
 
@@ -392,9 +480,9 @@ def detect_thrash(session_id=None, lookback=5):
 
     details = f"chain={len(chain_sessions)} recent_dead={dead_count}/{len(recent)} orphan_children={child_count}"
 
-    # Thrashing if: 3+ of last 5 sessions in chain are dead, OR
-    # this session already has 10+ dead children (runaway loop detection)
-    is_thrashing = dead_count >= 3 or child_count >= 10
+    # Thrashing if: dead_count >= threshold of last lookback sessions in chain, OR
+    # this session already has orphan_thresh+ dead children (runaway loop detection)
+    is_thrashing = dead_count >= dead_thresh or child_count >= orphan_thresh
 
     # v4: Also check git progress -- catches "busy but unproductive"
     git_ok, git_details = check_git_progress(session_id)
@@ -417,8 +505,9 @@ def check_can_continue(session_id=None):
     guard_rails = []
 
     # Check 1: Dead session thrash
+    dead_thresh = int(get_threshold("dead_session_threshold"))
     if thrashing:
-        if dead_count >= 3:
+        if dead_count >= dead_thresh:
             reasons.append(f"Thrash: {dead_count} dead sessions in recent chain ({details})")
         if not git_ok:
             reasons.append(f"Git stalled: {git_details}")
@@ -446,20 +535,22 @@ def check_can_continue(session_id=None):
             WHERE pattern_type = 'continuation_rate' AND pattern_key = ?
             ORDER BY last_seen DESC LIMIT 1
         """, (source,)).fetchone()
+        cont_rate_min = float(get_threshold("continuation_rate_min"))
         if rate_row:
             # Parse "XX.X% productive" from observation
             m = re.match(r'([\d.]+)%\s+productive', rate_row[0])
-            if m and float(m.group(1)) < 15:
+            if m and float(m.group(1)) < cont_rate_min:
                 guard_rails.append(f"Low continuation rate for {source}: {rate_row[0]}")
                 reasons.append(f"Source {source} has historically low continuation success")
 
     # 2b: Session size warning -- if parent session was massive, continuations tend to die
+    parent_size_warn = int(get_threshold("parent_size_warning"))
     conn = get_conn()
     if session_id:
         parent = conn.execute("SELECT parent_session_id FROM sessions WHERE id = ?", (session_id,)).fetchone()
         if parent and parent[0]:
             parent_msgs = conn.execute("SELECT message_count FROM sessions WHERE id = ?", (parent[0],)).fetchone()
-            if parent_msgs and parent_msgs[0] > 200:
+            if parent_msgs and parent_msgs[0] > parent_size_warn:
                 size_row = carry_conn.execute("""
                     SELECT observation FROM learned_patterns
                     WHERE pattern_type = 'size_success' AND pattern_key = 'massive'
@@ -471,7 +562,7 @@ def check_can_continue(session_id=None):
 
     # Check 3: Blocker age threshold
     blocker_halt = False
-    BLOCKER_HALT_HOURS = 4
+    BLOCKER_HALT_HOURS = float(get_threshold("blocker_halt_hours"))
     import time
     now = time.time()
     stale_blockers = carry_conn.execute("""
@@ -488,6 +579,26 @@ def check_can_continue(session_id=None):
 
     can_continue = not thrashing and not blocker_halt
 
+    # v5: Log the decision for later outcome tracking
+    import time as _time
+    thresholds_used = {k: get_threshold(k) for k in DEFAULT_THRESHOLDS}
+    decision_str = "continue" if can_continue else "halt"
+    carry_conn2 = get_carry_conn()
+    carry_conn2.execute("""
+        INSERT INTO decision_log (session_id, decision, reasons_json, thresholds_json, can_continue, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        session_id,
+        decision_str,
+        json.dumps(reasons),
+        json.dumps(thresholds_used),
+        1 if can_continue else 0,
+        _time.time(),
+    ))
+    decision_id = carry_conn2.execute("SELECT last_insert_rowid()").fetchone()[0]
+    carry_conn2.commit()
+    carry_conn2.close()
+
     return {
         "can_continue": can_continue,
         "reasons": reasons,
@@ -497,6 +608,7 @@ def check_can_continue(session_id=None):
         "git_progress": git_details,
         "blocker_halt": blocker_halt,
         "thrash_details": details,
+        "decision_id": decision_id,
     }
 
 
@@ -524,6 +636,381 @@ def cmd_should_continue(session_id=None):
             for gr in result["guard_rails"]:
                 print(f"    - {gr}")
         sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# v5: Outcome recording
+# ---------------------------------------------------------------------------
+
+def record_outcome(session_id=None):
+    """
+    Check what actually happened after a decision was made for a session.
+    If session_id is None, checks the most recent session with a logged decision.
+    Records the outcome in decision_outcomes table.
+    Returns the outcome dict.
+    """
+    import time
+    now = time.time()
+    carry_conn = get_carry_conn()
+
+    # Find the most recent decision for this session (or any session)
+    if session_id:
+        row = carry_conn.execute("""
+            SELECT id, session_id, decision, can_continue, created_at
+            FROM decision_log WHERE session_id = ?
+            ORDER BY created_at DESC LIMIT 1
+        """, (session_id,)).fetchone()
+    else:
+        row = carry_conn.execute("""
+            SELECT id, session_id, decision, can_continue, created_at
+            FROM decision_log
+            ORDER BY created_at DESC LIMIT 1
+        """).fetchone()
+
+    if not row:
+        carry_conn.close()
+        return {"error": "no decisions logged yet"}
+
+    decision_id, dec_session_id, decision, can_continue, decided_at = row
+
+    # Can't record outcomes without a session
+    if not dec_session_id:
+        carry_conn.close()
+        return {"error": "decision has no session_id, cannot determine outcome"}
+
+    # Check if already recorded
+    existing = carry_conn.execute("""
+        SELECT decision_id FROM decision_outcomes WHERE decision_id = ?
+    """, (decision_id,)).fetchone()
+    if existing:
+        carry_conn.close()
+        return {"status": "already_recorded", "decision_id": decision_id}
+
+    # Determine actual outcome
+    conn = get_conn()
+
+    # 1. Was the session productive? (had tool calls)
+    sess = conn.execute("""
+        SELECT message_count, tool_call_count FROM sessions WHERE id = ?
+    """, (dec_session_id,)).fetchone()
+    msg_count = sess[0] if sess else 0
+    tool_calls = sess[1] if sess else 0
+    productive = 1 if tool_calls > 0 else 0
+
+    # 2. Did the chain continue? (does this session have a child?)
+    child = conn.execute("""
+        SELECT id FROM sessions WHERE parent_session_id = ? LIMIT 1
+    """, (dec_session_id,)).fetchone()
+    chain_continued = 1 if child else 0
+
+    # 3. Did git move? (check git heads at decision time vs now)
+    git_moved = 0
+    # Get the session's recorded git heads
+    early_heads = carry_conn.execute("""
+        SELECT project_dir, git_head FROM chain_git_heads WHERE session_id = ?
+    """, (dec_session_id,)).fetchone()
+    if early_heads:
+        # Check if current HEAD differs -- walk all sessions in the chain after this one
+        child_sess = child[0] if child else None
+        if child_sess:
+            late_heads = carry_conn.execute("""
+                SELECT project_dir, git_head FROM chain_git_heads WHERE session_id = ?
+            """, (child_sess,)).fetchone()
+            if late_heads and early_heads[1] != late_heads[1]:
+                git_moved = 1
+    conn.close()
+
+    # Record the outcome
+    carry_conn.execute("""
+        INSERT INTO decision_outcomes
+        (decision_id, session_id, outcome_productive, outcome_git_moved,
+         outcome_chain_continued, outcome_tool_calls, outcome_message_count, checked_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        decision_id, dec_session_id, productive, git_moved,
+        chain_continued, tool_calls, msg_count, now
+    ))
+    carry_conn.commit()
+    carry_conn.close()
+
+    return {
+        "decision_id": decision_id,
+        "session_id": dec_session_id,
+        "decision": decision,
+        "outcome": {
+            "productive": bool(productive),
+            "git_moved": bool(git_moved),
+            "chain_continued": bool(chain_continued),
+            "tool_calls": tool_calls,
+            "messages": msg_count,
+        }
+    }
+
+
+def auto_record_outcomes():
+    """
+    Called from context command -- checks if previous session had a logged decision
+    and records the outcome if not yet done. Silent, no output.
+    """
+    conn = get_conn()
+    last = conn.execute("""
+        SELECT id FROM sessions
+        WHERE message_count > 5 AND source IN ('cli', 'telegram', 'whatsapp')
+        ORDER BY started_at DESC LIMIT 1
+    """).fetchone()
+    conn.close()
+    if last:
+        record_outcome(last[0])
+
+
+# ---------------------------------------------------------------------------
+# v5: Calibration
+# ---------------------------------------------------------------------------
+
+def cmd_calibrate():
+    """
+    Analyze decision history and find optimal threshold values.
+    Sweeps candidate values for each threshold, computes F1 scores,
+    and writes the best values to the config table.
+    """
+    import time
+    now = time.time()
+    carry_conn = get_carry_conn()
+
+    # Get all decisions that have outcomes
+    rows = carry_conn.execute("""
+        SELECT
+            dl.id, dl.session_id, dl.decision, dl.can_continue,
+            dl.reasons_json, dl.thresholds_json, dl.created_at,
+            do.outcome_productive, do.outcome_git_moved, do.outcome_chain_continued,
+            do.outcome_tool_calls
+        FROM decision_log dl
+        JOIN decision_outcomes do ON do.decision_id = dl.id
+        ORDER BY dl.created_at
+    """).fetchall()
+
+    if len(rows) < 10:
+        print(f"Need at least 10 decision+outcome pairs for calibration. Have {len(rows)}.")
+        print("Run record-outcome periodically, or use carry_forward for a few days first.")
+        carry_conn.close()
+        return
+
+    print(f"Calibrating from {len(rows)} decision+outcome pairs...\n")
+
+    # Ground truth: session was "good" if productive OR git moved OR chain continued productively
+    # A "halt" was correct if the session was unproductive.
+    # A "continue" was correct if the session was productive.
+    decisions = []
+    for r in rows:
+        (did, sid, decision, can_cont, reasons_j, thresh_j, decided_at,
+         productive, git_moved, chain_cont, tool_calls) = r
+        # Was the decision "right"?
+        # If we said continue, we want: productive (tool_calls > 0)
+        # If we said halt, we want: unproductive (tool_calls == 0)
+        actual_good = 1 if (productive or git_moved) else 0
+        predicted_good = can_cont  # 1 = continue (predicted good), 0 = halt (predicted bad)
+        decisions.append({
+            "decision_id": did,
+            "session_id": sid,
+            "predicted_good": predicted_good,
+            "actual_good": actual_good,
+            "productive": productive or 0,
+            "tool_calls": tool_calls or 0,
+        })
+
+    # --- Now try to do retrospective calibration on dead_session_threshold ---
+    # We can re-evaluate what WOULD have happened with different thresholds
+    # by re-checking the sessions with different dead_count cutoffs.
+
+    # For this we need the actual session data to re-compute dead counts
+    conn = get_conn()
+
+    # Collect chain data for each decision's session
+    session_dead_counts = {}
+    for d in decisions:
+        sid = d["session_id"]
+        if sid in session_dead_counts:
+            continue
+        # Walk chain to count dead sessions in last N
+        chain = []
+        current = sid
+        visited = set()
+        while current and current not in visited and len(chain) < 10:
+            visited.add(current)
+            row = conn.execute("""
+                SELECT id, parent_session_id, message_count, tool_call_count
+                FROM sessions WHERE id = ?
+            """, (current,)).fetchone()
+            if not row:
+                break
+            chain.append({
+                "id": row[0],
+                "alive": row[2] > 0 or row[3] > 0,
+            })
+            current = row[1]
+        # dead counts for lookback windows
+        dead_counts = {}
+        for window in range(3, 8):
+            recent = chain[:window]
+            dead_counts[window] = sum(1 for s in recent if not s["alive"])
+        session_dead_counts[sid] = dead_counts
+
+    conn.close()
+
+    # --- Sweep dead_session_threshold ---
+    print("=== dead_session_threshold ===")
+    best_f1 = -1
+    best_dead_thresh = int(get_threshold("dead_session_threshold"))
+    best_dead_lookback = int(get_threshold("dead_lookback"))
+
+    for lookback in range(3, 8):
+        for thresh in range(1, lookback + 1):
+            tp = fp = tn = fn = 0
+            for d in decisions:
+                sid = d["session_id"]
+                if sid not in session_dead_counts:
+                    continue
+                dead_at_window = session_dead_counts[sid].get(lookback, 0)
+                would_thrash = dead_at_window >= thresh
+                predicted_good = 0 if would_thrash else 1
+                actual = d["actual_good"]
+
+                if predicted_good == 1 and actual == 1: tp += 1
+                elif predicted_good == 1 and actual == 0: fp += 1
+                elif predicted_good == 0 and actual == 0: tn += 1
+                elif predicted_good == 0 and actual == 1: fn += 1
+
+            prec = tp / (tp + fp) if (tp + fp) > 0 else 0
+            rec = tp / (tp + fn) if (tp + fn) > 0 else 0
+            f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0
+
+            if f1 > best_f1:
+                best_f1 = f1
+                best_dead_thresh = thresh
+                best_dead_lookback = lookback
+                best_metrics = (tp, fp, tn, fn, prec, rec, f1)
+
+    tp, fp, tn, fn, prec, rec, f1 = best_metrics
+    current_val = f"{get_threshold('dead_session_threshold')}/{get_threshold('dead_lookback')}"
+    new_val = f"{best_dead_thresh}/{best_dead_lookback}"
+    print(f"  Current: dead >= {current_val} in lookback")
+    print(f"  Optimal: dead >= {best_dead_thresh} in lookback of {best_dead_lookback}")
+    print(f"  F1={f1:.3f} (P={prec:.3f} R={rec:.3f}) TP={tp} FP={fp} TN={tn} FN={fn}")
+
+    if new_val != current_val:
+        set_threshold("dead_session_threshold", str(best_dead_thresh), "calibration")
+        set_threshold("dead_lookback", str(best_dead_lookback), "calibration")
+        print(f"  UPDATED")
+    else:
+        print(f"  No change needed")
+    print()
+
+    # --- Sweep continuation_rate_min ---
+    print("=== continuation_rate_min ===")
+    # For this we need source continuation rates from learned_patterns
+    source_rates = {}
+    rate_rows = carry_conn.execute("""
+        SELECT pattern_key, observation FROM learned_patterns
+        WHERE pattern_type = 'continuation_rate'
+    """).fetchall()
+    for key, obs in rate_rows:
+        m = re.match(r'([\d.]+)%\s+productive', obs)
+        if m:
+            source_rates[key] = float(m.group(1))
+
+    best_f1 = -1
+    best_rate = float(get_threshold("continuation_rate_min"))
+    # Get source for each decision's session
+    conn = get_conn()
+    for test_rate in [5, 8, 10, 12, 15, 20, 25, 30]:
+        tp = fp = tn = fn = 0
+        for d in decisions:
+            sid = d["session_id"]
+            src_row = conn.execute("SELECT source FROM sessions WHERE id = ?", (sid,)).fetchone()
+            source = src_row[0] if src_row else None
+            rate = source_rates.get(source, 100)  # unknown sources get a pass
+            would_halt = rate < test_rate
+            predicted_good = 0 if would_halt else 1
+            actual = d["actual_good"]
+
+            if predicted_good == 1 and actual == 1: tp += 1
+            elif predicted_good == 1 and actual == 0: fp += 1
+            elif predicted_good == 0 and actual == 0: tn += 1
+            elif predicted_good == 0 and actual == 1: fn += 1
+
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0
+
+        if f1 > best_f1:
+            best_f1 = f1
+            best_rate = test_rate
+            rate_metrics = (tp, fp, tn, fn, prec, rec, f1)
+    conn.close()
+
+    tp, fp, tn, fn, prec, rec, f1 = rate_metrics
+    current_val = get_threshold("continuation_rate_min")
+    print(f"  Current: <{current_val}%")
+    print(f"  Optimal: <{best_rate}%")
+    print(f"  F1={f1:.3f} (P={prec:.3f} R={rec:.3f}) TP={tp} FP={fp} TN={tn} FN={fn}")
+
+    if str(best_rate) != current_val:
+        set_threshold("continuation_rate_min", str(best_rate), "calibration")
+        print(f"  UPDATED")
+    else:
+        print(f"  No change needed")
+    print()
+
+    # --- Sweep blocker_halt_hours ---
+    # Harder to calibrate without blocker data. Show current config.
+    print("=== blocker_halt_hours ===")
+    print(f"  Current: {get_threshold('blocker_halt_hours')}h")
+    print(f"  (Requires blocker outcome data to calibrate. Manual tuning recommended.)")
+    print()
+
+    # Summary
+    config_rows = carry_conn.execute("""
+        SELECT key, value, source FROM config ORDER BY key
+    """).fetchall()
+    carry_conn.close()
+
+    print("=== CURRENT CONFIG ===")
+    for key, value, source in config_rows:
+        default = DEFAULT_THRESHOLDS.get(key, "?")
+        changed = " (CUSTOM)" if value != default else ""
+        print(f"  {key} = {value} [{source}]{changed}")
+    print()
+    print(f"Calibration complete. {len(rows)} decisions analyzed.")
+
+
+def cmd_show_config():
+    """Show current threshold values and their sources."""
+    carry_conn = get_carry_conn()
+    config_rows = carry_conn.execute("""
+        SELECT key, value, source, updated_at FROM config ORDER BY key
+    """).fetchall()
+    carry_conn.close()
+
+    print("=== CARRY FORWARD v5 CONFIG ===\n")
+    for key in DEFAULT_THRESHOLDS:
+        default = DEFAULT_THRESHOLDS[key]
+        # Check if overridden
+        overridden = None
+        for ck, cv, cs, cu in config_rows:
+            if ck == key:
+                overridden = (cv, cs, cu)
+                break
+
+        if overridden:
+            val, src, ts = overridden
+            ts_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "?"
+            print(f"  {key}")
+            print(f"    value: {val}  (default: {default})")
+            print(f"    source: {src}  updated: {ts_str}")
+        else:
+            print(f"  {key}")
+            print(f"    value: {default}  (default)")
+        print()
 
 
 # ---------------------------------------------------------------------------
@@ -998,6 +1485,9 @@ def cmd_summary(session_id=None):
 
 def cmd_context(include_cron=False):
     """Full context from last session, with git state, summary, chain, and blockers."""
+    # v5: Auto-record outcome from previous session before showing context
+    auto_record_outcomes()
+
     conn = get_conn()
     cur = conn.cursor()
 
@@ -1372,6 +1862,14 @@ if __name__ == "__main__":
         print(f"Recorded git HEADs for {n} projects in session {sys.argv[2]}")
     elif cmd == "learn":
         cmd_learn()
+    elif cmd == "record-outcome":
+        sid = sys.argv[2] if len(sys.argv) > 2 else None
+        result = record_outcome(sid)
+        print(json.dumps(result, indent=2))
+    elif cmd == "calibrate":
+        cmd_calibrate()
+    elif cmd == "show-config":
+        cmd_show_config()
     else:
         print(f"Unknown command: {cmd}")
         print(__doc__)
