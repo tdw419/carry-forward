@@ -1,291 +1,288 @@
-# CARRY FORWARD v3 -- AI Agent Guide
+# Carry Forward AI Guide
 
-This document teaches AI agents how to continue work across Hermes sessions.
+Everything an AI agent needs to understand, use, improve, and test carry_forward.
+Zero prior context required.
 
-You may have been told to "load the carry-forward skill" or "read this document to continue previous work." This is that document. Read it top to bottom, then follow the instructions.
+## What Carry Forward Is
 
----
+A decision engine for session continuation. When an autonomous loop wants to know
+"should I spawn another session to keep working?", carry_forward answers yes or no
+based on evidence: chain health, git progress, blocker state, and session activity.
 
-## What Is This
+It is NOT a task manager, context summarizer, or workflow orchestrator. It makes
+one decision (continue or halt) and logs everything so that decision can be audited
+and improved.
 
-Hermes sessions are single conversations. When a session ends, everything in it is gone. Carry Forward reads the database of past conversations to figure out what was happening, then picks up where the last session left off.
-
-**v3 adds:** thrash detection (prevents runaway chains), self-learning from session history, and a `should-continue` exit-code gate for cron scripts.
-
-The database is at `~/.hermes/state.db` (SQLite). Hermes writes every message to it automatically.
-Carry Forward has its own metadata DB at `~/.hermes/carry_forward.db` for blockers and chain metadata.
-
----
-
-## Step 1: Get Oriented
-
-Run this command immediately:
+## The Feedback Loop (How It Improves Itself)
 
 ```
-python3 /home/jericho/zion/projects/carry_forward/carry_forward/carry_forward.py context
+1. check_can_continue() runs
+   -> logs decision to decision_log (continue/halt, reasons, thresholds used)
+
+2. The session plays out (or doesn't)
+
+3. record_outcome checks what actually happened
+   -> logs to decision_outcomes (was it productive? did git move? tool call count?)
+
+4. calibrate sweeps threshold values against decision+outcome pairs
+   -> writes optimal thresholds to config table
+
+5. replay_harness.py measures overall accuracy (precision, recall, F1)
+   -> tells you if a change helped or hurt
 ```
 
-This prints everything you need:
+This is the legitimate recursive improvement loop: not self-modifying code, but
+self-tuning behavior from evidence. Every decision is logged, every outcome is
+tracked, every threshold can be calibrated from data.
 
+## The Decision Pipeline
+
+When `check_can_continue(session_id)` is called, these checks run in order:
+
+### Check 1: Dead Session Thrash
+Walks the parent chain backwards. Counts how many recent sessions had 0 messages
+and 0 tool calls. If dead_count >= dead_session_threshold (default 3) out of the
+last dead_lookback (default 5) sessions, the chain is thrashing. Halt.
+
+### Check 2: Git Progress
+Compares git HEAD snapshots from the start and end of the chain. If nothing moved
+across git_min_sessions (default 3) sessions, the chain is busy but unproductive.
+Halt. (This is nested inside thrash detection -- git stall sets thrashing=True.)
+
+### Check 3: Learned Patterns
+Checks the learned_patterns table for:
+- Source continuation rates (e.g., "cli sessions: 12% productive"). Below
+  continuation_rate_min (default 15%) triggers a warning.
+- Parent session size warnings (massive parents tend to produce dead continuations).
+
+These are warnings/guard_rails, not hard halts. They appear in the decision output
+but don't block continuation on their own.
+
+### Check 4: Blocker Age
+Persistent blockers with a timestamp older than blocker_halt_hours (default 4h)
+trigger a hard halt. The idea: if something is blocked and nobody has fixed it in
+hours, continuing will just waste cycles.
+
+### Check 5: Session Activity (v5.1)
+Checks whether the session being evaluated has actually done anything. If it has
+0 tool calls AND <=2 messages, it's dead. Don't spawn continuations from a dead
+session. This was the #1 fix from replay analysis -- 92% of "continue" decisions
+were for empty sessions.
+
+### Decision
 ```
-SESSION: 20260410_085841_d10eaf
-TITLE: Building a Self-Hosting Pixel Text Programming System
-STARTED: 2026-04-10 08:58
-
-=== WHAT WAS REQUESTED ===             <-- first user message (the original task)
-
-=== SESSION SUMMARY ===                <-- smart extraction of completed/errors/next
-  KEY FACTS:
-    20/20 assembler tests pass including the 5 new ones
-    11/11 tests pass, clean build, commit is real
-  COMPLETED:
-    [x] VM-resident micro-assembler
-    [x] BEQ/BNE/BLT/BGE/BLTU/BGEU branch aliases
-  NEXT / REMAINING:
-    [ ] Fill in more opcodes
-    [ ] Self-hosting assembler
-
-=== PROJECT STATUS ===                 <-- git state for detected projects
-  /home/jericho/zion/projects/geometry_os (branch: master)
-    41d32bc feat: VM-resident micro-assembler
-    e89ba71 feat: F9 inline code editor
-    DIRTY: 1 uncommitted changes
-      M src/vm.rs
-
-=== CHAIN DEPTH: 2 continuation(s) === <-- how deep the carry-forward chain is
-
-=== UNRESOLVED BLOCKERS ===            <-- any blockers recorded by previous sessions
-  [2026-04-10 08:00] Need decision on opcode format
-```
-
-From this output, determine:
-- What project you're working on (from PROJECT STATUS)
-- What the user asked for (from WHAT WAS REQUESTED)
-- What was completed (from SESSION SUMMARY)
-- What's still in progress (from NEXT / REMAINING)
-- What's blocking progress (from UNRESOLVED BLOCKERS)
-
----
-
-## Step 2: Get More Detail If Needed
-
-If the `context` output doesn't give you enough to continue confidently:
-
-**Deep summary of a specific session:**
-```
-python3 .../carry_forward.py summary SESSION_ID
+can_continue = NOT thrashing AND NOT blocker_halt AND NOT session_dead
 ```
 
-**Git status for a specific session's projects:**
-```
-python3 .../carry_forward.py status SESSION_ID
-```
+## Commands
 
-**Trace the full continuation chain:**
-```
-python3 .../carry_forward.py chain [SESSION_ID]
-```
-Shows all parent/child sessions in order. Warns if chain depth >= 10.
+### Reading State
 
-**Read raw messages from a session:**
-```
-python3 .../carry_forward.py messages SESSION_ID --last 10
-```
-
-**List recent sessions:**
-```
-python3 .../carry_forward.py last --depth 5
-```
-
----
-
-## Step 3: Continue The Work
-
-You now have enough context. Do the work. Rules:
-
-1. **Do not repeat completed work.** The SESSION SUMMARY shows what's done. The PROJECT STATUS shows what's committed. Trust git over conversation claims.
-2. **Pick up at the exact stopping point.** The NEXT / REMAINING section tells you where to resume.
-3. **Respect blockers.** If there are unresolved blockers, don't barrel past them. They were recorded for a reason.
-4. **Use the same project directory.** The PROJECT STATUS section tells you where the code lives and what branch it's on.
-5. **Check dirty state.** If PROJECT STATUS shows dirty files, the last session may have left uncommitted work. Investigate before overwriting.
-
----
-
-## Step 4: Record Blockers (If Any)
-
-If you hit something that needs human input, record it so the next session knows:
-
-```
-python3 .../carry_forward.py block "need Jericho to decide on the API contract"
-```
-
-Next session's `context` output will show this blocker automatically.
-
-When resolved:
-```
-python3 .../carry_forward.py unblock "API contract"
-```
-
----
-
-## Step 5: Carry Forward (Optional)
-
-If there is clearly more work to do and you want the NEXT session to continue after this one, schedule a one-shot cron job:
-
-```
-cronjob(
-  action='create',
-  name='carry-forward',
-  schedule='1m',
-  repeat=1,
-  prompt='Read the file at /home/jericho/zion/projects/carry_forward/carry_forward/AI_GUIDE.md and follow its instructions. Then continue the work.',
-  skills=['carry-forward']
-)
-```
-
-This fires a new Hermes session 1 minute after this one ends. The new session will read this same document, run the context script, and pick up.
-
-**Do NOT carry forward if:**
-- The work is done
-- You are blocked and need human input (record a blocker instead)
-- You are unsure what to do next
-- Chain depth is >= 10 (check `context` output -- it warns you)
-
----
-
-## Step 6: Know When To Stop
-
-Stop and do NOT schedule another session if any of these are true:
-
-- **No clear next step.** You finished the task and there is nothing obviously next.
-- **Stuck.** You tried something twice and it didn't work. Record a blocker, stop.
-- **Needs a decision.** The work requires an architectural or design choice that a human should make. Record it as a blocker.
-- **No progress.** Compare the current state (git log) to what the previous session reported. If nothing new was committed, stop.
-- **Chain too deep.** If the `context` output warns about chain depth, stop.
-
-When you stop, print a clear summary of what you accomplished and what still needs to happen. A human will read it.
-
----
-
-## Command Reference
-
-All commands use the helper script at:
-```
-/home/jericho/zion/projects/carry_forward/carry_forward/carry_forward.py
-```
-
-| Command | Flags | Output |
-|---------|-------|--------|
-| `context` | `--include-cron` | Full context: summary + git state + chain + blockers |
-| `status` | `[SESSION_ID]` | Git state for all projects detected in session |
-| `summary` | `[SESSION_ID]` | Smart progress extraction (completed/errors/next) |
-| `chain` | `[SESSION_ID]` | Parent/child continuation chain with depth warning |
-| `last` | `--depth N`, `--include-cron` | List of recent sessions |
-| `messages SESSION_ID` | `--last N` | Messages from one session |
-| `last-id` | `--include-cron` | Just the session ID |
-| `block MSG` | (none) | Record a new blocker |
-| `blockers` | (none) | Show unresolved blockers |
-| `unblock PATTERN` | (none) | Resolve blockers matching pattern |
-| `should-continue` | `[SESSION_ID]` | Exit 0 if safe to chain, 1 if thrashing |
-| `learn` | (none) | Analyze session history, record patterns |
-
-If SESSION_ID is omitted, commands default to the most recent non-trivial session.
-
----
-
-## Thrash Detection
-
-Carry Forward v3 automatically detects when a continuation chain is thrashing -- sessions firing but producing no output.
-
-**How it works:**
-- Walks the chain backwards looking for dead sessions (zero messages, zero tool calls)
-- If 3+ of the last 5 sessions in the chain are dead: **THRASHING**
-- If a session already has 10+ dead children (runaway loop): **THRASHING**
-
-**In `context`:** The THRASH CHECK section shows the status automatically.
-
-**For cron scripts:** Use `should-continue` as a gate:
 ```bash
-python3 .../carry_forward.py should-continue
-if [ $? -ne 0 ]; then
-    echo "Thrashing detected, aborting"
-    exit 0
-fi
-# ... proceed with work
+# Full context: what happened, what's next, can we continue?
+python3 ~/zion/projects/carry_forward/carry_forward/carry_forward.py context
+
+# JSON output of the full decision for programmatic use
+python3 ~/zion/projects/carry_forward/carry_forward/carry_forward.py check-can-continue [SESSION_ID]
+
+# Exit code interface (0=safe, 1=halt) for cron/loop scripts
+python3 ~/zion/projects/carry_forward/carry_forward/carry_forward.py should-continue
 ```
 
-**Historical data:** Your session history has 86.8% dead continuations (1,738 out of 2,002). The worst case was a single session that spawned 405 empty children. The thrash detector would have stopped that immediately.
+### Recording
 
----
+```bash
+# Snapshot git HEADs at the start of a session (for progress tracking)
+python3 ~/zion/projects/carry_forward/carry_forward/carry_forward.py record-git-heads SESSION_ID
 
-## Self-Learning
-
-Run `learn` periodically to analyze session history and record patterns:
-
-```
-python3 .../carry_forward.py learn
+# Record what happened after a decision (auto-called from context)
+python3 ~/zion/projects/carry_forward/carry_forward/carry_forward.py record-outcome [SESSION_ID]
 ```
 
-It discovers:
-- **Continuation success rates** by source (cli/cron/whatsapp)
-- **Runaway chains** -- sessions that spawned >80% dead children
-- **Session size vs success** -- small parent sessions have 40-50% productive continuations; massive ones only 4.7%
-- **Time-of-day productivity** -- which hours produce the most substantial work
-- **Overall stats** -- total sessions, continuation rates, dead session percentage
+### Tuning
 
-Learned patterns appear in `context` output under LEARNED INSIGHTS, so every continuation session benefits from the accumulated knowledge.
+```bash
+# Auto-tune thresholds from decision history (needs 10+ outcomes)
+python3 ~/zion/projects/carry_forward/carry_forward/carry_forward.py calibrate
 
----
+# Show current threshold values and where they came from
+python3 ~/zion/projects/carry_forward/carry_forward/carry_forward.py show-config
 
-## Database Details
+# Mine session history for patterns (source rates, time-of-day, size effects)
+python3 ~/zion/projects/carry_forward/carry_forward/carry_forward.py learn
+```
 
-**Hermes state DB:** `/home/jericho/.hermes/state.db` (SQLite)
-- Tables: `sessions`, `messages`
-- Sessions: `id`, `source` (cli/telegram/whatsapp/cron), `parent_session_id`, `message_count`, `title`, timestamps
-- Messages: `session_id`, `role` (user/assistant/tool/system), `content`, `tool_calls`, timestamps
-- Full-text search index on messages via `messages_fts`
+### Blockers
 
-**Carry Forward metadata DB:** `~/.hermes/carry_forward.db` (SQLite, auto-created)
-- Tables: `blockers` (persistent blockers), `chain_meta` (session chain tracking)
-- Blockers: `session_id`, `message`, `created_at`, `resolved_at`
-- Chain meta: `session_id`, `parent_session_id`, `continuation_count`, `outcome`, `project_dir`
+```bash
+# List active blockers
+python3 ~/zion/projects/carry_forward/carry_forward/carry_forward.py blockers
 
----
+# Add a blocker (will halt future continuations until resolved)
+python3 ~/zion/projects/carry_forward/carry_forward/carry_forward.py block "waiting on API key from ops"
 
-## Troubleshooting
+# Remove a blocker
+python3 ~/zion/projects/carry_forward/carry_forward/carry_forward.py unblock "API key"
+```
 
-**"No sessions with real content found"**
-The database has no sessions matching the filters. Either the database is empty, or all sessions had fewer than 5 messages. Try `--include-cron`.
+### Replay Testing
 
-**The context output shows the wrong session**
-The script picks the most recent session with >5 messages from cli/telegram/whatsapp. If you want a different session, use `last` to find it, then `summary SESSION_ID` or `messages SESSION_ID` to read it.
+```bash
+# Full replay: compare current and proposed logic against historical outcomes
+python3 ~/zion/projects/carry_forward/carry_forward/replay_harness.py
 
-**No git status showing**
-The script detects file paths from the conversation and checks if they're in git repos. If no files were mentioned, or the paths aren't in git repos, git status won't appear. Use `status SESSION_ID` with a specific session that had file operations.
+# Show which sessions would change and whether the change is correct
+python3 ~/zion/projects/carry_forward/carry_forward/replay_harness.py --fixes
 
-**The work described doesn't match reality**
-The SESSION SUMMARY extracts from conversation text. Git history (shown in PROJECT STATUS) is more reliable. Always trust commits over conversation claims.
+# Show misclassified sessions (false positives and false negatives)
+python3 ~/zion/projects/carry_forward/carry_forward/replay_harness.py --misclassified
 
----
+# Replay a single session in detail
+python3 ~/zion/projects/carry_forward/carry_forward/replay_harness.py --session SESSION_ID
+```
+
+## The Database
+
+carry_forward reads session history from `~/.hermes/state.db` (Hermes core) and
+stores its own metadata in `~/.hermes/carry_forward.db`.
+
+### Tables in carry_forward.db
+
+| Table | Purpose |
+|-------|---------|
+| decision_log | Every check_can_continue() call: decision, reasons, thresholds |
+| decision_outcomes | What actually happened after each decision |
+| config | 8 tunable thresholds (defaults + calibration overrides) |
+| chain_meta | Session chain metadata |
+| chain_git_heads | Git HEAD snapshots per session per project |
+| blockers | Persistent blockers with timestamps |
+| learned_patterns | Source rates, size effects, time-of-day patterns |
+
+### Key Relationships
+
+```
+decision_log.id  -->  decision_outcomes.decision_id  (1:1)
+sessions.id      -->  decision_log.session_id         (many:1, from state.db)
+sessions.parent_session_id  -->  sessions.id          (chain)
+```
+
+## Tunable Thresholds
+
+| Key | Default | What it controls |
+|-----|---------|-----------------|
+| dead_session_threshold | 3 | dead sessions >= this in lookback = thrashing |
+| dead_lookback | 5 | how many recent sessions to check for dead count |
+| orphan_child_threshold | 10 | dead children >= this = runaway loop |
+| continuation_rate_min | 15 | source rate < this% = warning |
+| blocker_halt_hours | 4 | blocker age > this = halt |
+| git_min_sessions | 3 | chain length needed for git progress check |
+| parent_size_warning | 200 | parent msg count > this = warning |
+| chain_depth_warning | 8 | chain depth >= this = warning |
+
+All are read via `get_threshold(key)`, written via `set_threshold(key, value, source)`.
+Calibration writes with source="calibration". Manual changes use source="manual".
+
+## How to Make carry_forward Better
+
+### The Safe Process
+
+1. **Run the replay harness** to get current metrics
+2. **Analyze misclassified sessions** to find patterns
+3. **Propose a fix** and add it to replay_with_fix() in replay_harness.py
+4. **Re-run the harness** to see if F1 improves
+5. **If F1 went up**: apply the fix to check_can_continue(), commit
+6. **If F1 went down or regressed**: discard the fix, keep the old logic
+
+### What Counts as "Productive"
+
+A session is marked productive (outcome_productive=1) if it had any tool calls.
+This is a blunt instrument -- a session that made 1 API call and 100 tool calls
+are both "productive" -- but it correlates well with actual work getting done.
+
+### Common Pitfalls
+
+- **Don't over-fit to historical data.** The replay harness measures against past
+  decisions. If you tune thresholds to perfectly predict those 499 sessions, you
+  may make the system worse for new situations. Prefer simple rules that catch
+  clear patterns (like the dead-session check) over complex multi-factor rules.
+
+- **Batch data skews metrics.** The 188 decisions logged at a single timestamp
+  were a bulk backfill, not live decisions. They're mostly "halt" on productive
+  sessions, which tanks your FN count. The harness flags these. When computing
+  live metrics, exclude them (timestamp 1775844222).
+
+- **"Alive" has a low bar.** A session with 1 message and 0 tool calls is
+  considered "alive" in thrash detection. This is intentional -- some sessions
+  are short by design (user asked a quick question, got an answer). The
+  session_dead check (0 tools AND <=2 msgs) catches the ones that are truly dead.
+
+- **Outcome recording is lazy.** Outcomes are recorded when `context` or
+  `record-outcome` runs, not automatically at session end. If nobody calls these,
+  the outcome never gets recorded and the calibration data is incomplete.
+
+## Architecture Diagram
+
+```
+state.db (Hermes core)
+  sessions ──────────┐
+  messages           │
+                     │
+                     ▼
+              detect_thrash() ──► thrashing? dead_count
+              check_git_progress() ──► git_ok? git_details
+              learned_patterns ──► source_rate, size_warning
+              blockers ──► stale? age_hours
+              session self ──► tool_calls, message_count
+                     │
+                     ▼
+              check_can_continue()
+                     │
+              ┌──────┴──────┐
+              │             │
+         continue        halt
+              │             │
+              ▼             ▼
+         decision_log (with reasons, thresholds)
+              │
+              ▼
+         session plays out
+              │
+              ▼
+         record_outcome() ──► decision_outcomes
+              │
+              ▼
+         calibrate() ──► config (threshold updates)
+              │
+              ▼
+         replay_harness.py ──► precision, recall, F1
+```
 
 ## File Locations
 
 ```
-Helper script:   /home/jericho/zion/projects/carry_forward/carry_forward/carry_forward.py
-This document:   /home/jericho/zion/projects/carry_forward/carry_forward/AI_GUIDE.md
-Project README:  /home/jericho/zion/projects/carry_forward/carry_forward/README.md
-Session DB:      ~/.hermes/state.db
-Metadata DB:     ~/.hermes/carry_forward.db
+~/zion/projects/carry_forward/carry_forward/
+  carry_forward.py    -- the main script (~1890 lines, zero deps)
+  replay_harness.py   -- accuracy testing against historical decisions
+  AI_GUIDE.md         -- this file
+
+~/.hermes/
+  state.db            -- Hermes session/message data (READ ONLY)
+  carry_forward.db    -- carry_forward metadata (READ/WRITE)
 ```
 
----
+## Quick Reference for Agents
 
-## What Changed in v3
+"I need to decide whether to continue a session":
+  -> `should-continue` (exit code 0/1)
 
-If you used carry_forward v2 before, here's what's new:
-- **Thrash detection**: Automatically detects dead continuation chains and runaway loops. Warns in `context`, blocks in `should-continue`.
-- **`should-continue`**: Exit-code command for cron scripts. Returns 1 if thrashing detected. Prevents runaway chains before they start.
-- **`learn`**: Analyzes the full 9,000+ session history to discover success/failure patterns. Records findings that appear in every `context` output.
-- **Runaway loop detection**: If a session has 10+ dead children, it's flagged as thrashing regardless of chain state.
-- **Learned insights in context**: Every `context` call now shows relevant learned patterns (continuation rates, size-success correlations, productive hours).
-- **`learned_patterns` table** in carry_forward.db for persistent pattern storage.
+"I need the full context for handoff":
+  -> `context` (prints everything)
+
+"I want to tune the system":
+  -> `calibrate` then `replay_harness.py`
+
+"Something is blocking progress":
+  -> `block "description"`
+
+"I changed the decision logic and want to verify":
+  -> `replay_harness.py` before and after. F1 should go up.
