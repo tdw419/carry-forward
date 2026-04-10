@@ -912,6 +912,138 @@ def cmd_context(include_cron=False):
 # Main
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Library API (for import by session_chain and other tools)
+# ---------------------------------------------------------------------------
+
+def get_context_data(session_id=None, include_cron=False):
+    """
+    Programmatic version of cmd_context(). Returns a dict with:
+      session_id, title, what_requested, last_user_msg,
+      summary (dict with completed/errors/next/key_facts),
+      projects (list of git states),
+      chain_depth, thrashing, thrash_details,
+      learned_insights, blockers
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+
+    if not session_id:
+        sources = "('cli', 'telegram', 'whatsapp')" if not include_cron else "('cli', 'telegram', 'whatsapp', 'cron')"
+        cur.execute(f"""
+            SELECT id, message_count, title, parent_session_id, started_at
+            FROM sessions
+            WHERE message_count > 5 AND source IN {sources}
+            ORDER BY started_at DESC LIMIT 1
+        """)
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return {"error": "no sessions found"}
+        session_id = row[0]
+
+    cur.execute("""
+        SELECT id, message_count, title, parent_session_id, started_at
+        FROM sessions WHERE id = ?
+    """, (session_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return {"error": f"session {session_id} not found"}
+
+    sid, msg_count, title, parent_id, started_at = row
+
+    cur.execute("""
+        SELECT role, content FROM messages
+        WHERE session_id = ? AND role IN ('user', 'assistant')
+        ORDER BY timestamp ASC
+    """, (session_id,))
+    rows = cur.fetchall()
+    user_msgs = [r[1] for r in rows if r[0] == "user"]
+    asst_msgs = [r[1] for r in rows if r[0] == "assistant"]
+    conn.close()
+
+    # Summary extraction
+    summary = {"completed": [], "in_progress": [], "next": [], "errors": [], "key_facts": []}
+    for msg in asst_msgs:
+        prog = extract_progress(msg)
+        for key in summary:
+            summary[key].extend(prog[key])
+    for key in summary:
+        seen = set()
+        deduped = []
+        for item in summary[key]:
+            if item not in seen:
+                seen.add(item)
+                deduped.append(item)
+        summary[key] = deduped[:10]
+
+    # Project detection + git state
+    all_text = " ".join(r[1] or "" for r in rows)
+    paths = set(re.findall(r"/home/jericho/[a-zA-Z0-9_/.-]+\.[a-z]{1,4}", all_text))
+    dirs = sorted(set(p.rsplit("/", 1)[0] for p in paths))[:10]
+    projects = []
+    for d in dirs:
+        gs = git_status(d)
+        if not gs.get("error") and gs.get("git_root"):
+            projects.append(gs)
+
+    # Chain depth
+    chain_depth = 0
+    current = parent_id
+    visited = set()
+    while current and current not in visited and chain_depth < 25:
+        visited.add(current)
+        conn2 = get_conn()
+        r = conn2.execute("SELECT parent_session_id FROM sessions WHERE id = ?", (current,)).fetchone()
+        conn2.close()
+        if not r:
+            break
+        chain_depth += 1
+        current = r[0]
+
+    # Thrash detection
+    thrashing, dead_count, _, thrash_details = detect_thrash(session_id)
+
+    # Learned insights
+    carry_conn = get_carry_conn()
+    insights = carry_conn.execute("""
+        SELECT pattern_type, observation FROM learned_patterns
+        WHERE pattern_type IN ('continuation_rate', 'overview', 'runaway_chains')
+        ORDER BY last_seen DESC LIMIT 5
+    """).fetchall()
+
+    # Blockers
+    blockers = carry_conn.execute("""
+        SELECT message, created_at FROM blockers WHERE resolved_at IS NULL
+        ORDER BY created_at DESC LIMIT 5
+    """).fetchall()
+    carry_conn.close()
+
+    return {
+        "session_id": sid,
+        "title": title,
+        "what_requested": (user_msgs[0] or "")[:500] if user_msgs else None,
+        "last_user_msg": (user_msgs[-1] or "")[:500] if user_msgs and len(user_msgs) > 1 else None,
+        "summary": summary,
+        "projects": [{
+            "root": p.get("git_root"),
+            "branch": p.get("branch"),
+            "last_commits": p.get("last_commits", [])[:3],
+            "dirty": p.get("dirty", False),
+        } for p in projects],
+        "chain_depth": chain_depth,
+        "thrashing": thrashing,
+        "thrash_details": thrash_details,
+        "learned_insights": [{"type": t, "observation": o} for t, o in insights],
+        "blockers": [{"message": m, "created": ts} for m, ts in blockers],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(__doc__)
