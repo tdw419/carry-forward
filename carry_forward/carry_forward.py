@@ -577,7 +577,23 @@ def check_can_continue(session_id=None):
             reasons.append(f"Stale blocker ({age_h:.1f}h old): {msg}")
         blocker_halt = True
 
-    can_continue = not thrashing and not blocker_halt
+    # Check 4: Current session activity (v5.1)
+    # If this session itself has 0 tool calls and <=2 messages, it's dead.
+    # Don't spawn continuations from a dead session -- this was the #1 source
+    # of false continues (184/201 = 92% of "continue" decisions were wrong).
+    session_dead = False
+    conn_check = get_conn()
+    if session_id:
+        own_row = conn_check.execute(
+            "SELECT tool_call_count, message_count FROM sessions WHERE id = ?",
+            (session_id,)
+        ).fetchone()
+        if own_row and own_row[0] == 0 and own_row[1] <= 2:
+            session_dead = True
+            reasons.append(f"Session dead: 0 tool calls, {own_row[1]} messages")
+    conn_check.close()
+
+    can_continue = not thrashing and not blocker_halt and not session_dead
 
     # v5: Log the decision for later outcome tracking
     import time as _time
@@ -607,6 +623,7 @@ def check_can_continue(session_id=None):
         "dead_count": dead_count,
         "git_progress": git_details,
         "blocker_halt": blocker_halt,
+        "session_dead": session_dead,
         "thrash_details": details,
         "decision_id": decision_id,
     }
