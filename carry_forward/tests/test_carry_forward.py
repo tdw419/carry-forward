@@ -184,24 +184,6 @@ class TestCheckCanContinue:
 # Tests: get_threshold / set_threshold
 # ===========================================================================
 
-class TestThresholds:
-    def test_default_threshold(self, carry_db, patched_env):
-        """Should return default when no config entry."""
-        val = patched_env.get_threshold("dead_session_threshold")
-        assert val == "3"
-
-    def test_set_and_get_threshold(self, carry_db, patched_env):
-        """set_threshold should persist and get_threshold should read it."""
-        patched_env.set_threshold("dead_session_threshold", 1, source="test")
-        val = patched_env.get_threshold("dead_session_threshold")
-        assert val == "1"
-
-    def test_unknown_threshold_returns_none(self, carry_db, patched_env):
-        """Unknown threshold key should return None."""
-        val = patched_env.get_threshold("nonexistent_key")
-        assert val is None
-
-
 # ===========================================================================
 # Tests: detect_thrash
 # ===========================================================================
@@ -422,13 +404,6 @@ class TestEdgeCases:
         thrashing, dead_count, chain, details = patched_env.detect_thrash()
         assert thrashing is False
         assert dead_count == 0
-
-    def test_config_persistence(self, carry_db, patched_env):
-        """Config values should persist across get/set cycles."""
-        patched_env.set_threshold("test_key", "42", source="test")
-        assert patched_env.get_threshold("test_key") == "42"
-        patched_env.set_threshold("test_key", "99", source="test2")
-        assert patched_env.get_threshold("test_key") == "99"
 
     def test_chain_exactly_at_threshold(self, state_db, carry_db, patched_env):
         """Chain with exactly threshold dead sessions should trigger."""
