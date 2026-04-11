@@ -34,13 +34,14 @@ Catches agents deleting tests to make suites pass.
 ## Phase 4: Consecutive No-Op Counter
 Unified metric that subsumes Phase 1 and Phase 2.
 
-- [ ] Add `consecutive_noops` column to chain_meta (default 0)
-- [ ] No-op definition: tick with 0 commits AND 0 test count increase AND same files edited
-- [ ] Increment on no-op, reset to 0 on any commit or test increase
-- [ ] If consecutive_noops >= 3, hard halt
-- [ ] Wire into check_can_continue as a single unified check
-- [ ] Deprecate separate git_stalled halt (now subsumed)
-- [ ] Test: 3 no-ops halts, 1 productive tick resets, then 2 more no-ops is fine
+- [x] Add `consecutive_noops` column to chain_meta (default 0)
+- [x] No-op definition: tick with 0 commits AND 0 test count increase AND same files edited
+- [x] Increment on no-op, reset to 0 on any commit or test increase
+- [x] If consecutive_noops >= 3, hard halt
+- [x] Wire into check_can_continue as a single unified check
+- [x] Deprecate separate git_stalled halt (now subsumed)
+- [x] Test: 3 no-ops halts, 1 productive tick resets, then 2 more no-ops is fine
+- [x] Bugfix: _get_chain_stalls and _count_consecutive_noops were comparing to wrong parent (chain[i-1] instead of chain[i+1])
 
 ## Phase 5: Doctor Check
 Environment validation before each tick starts work.

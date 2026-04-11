@@ -46,7 +46,8 @@ def _create_carry_db(path):
             session_id TEXT PRIMARY KEY, parent_session_id TEXT,
             continuation_count INTEGER DEFAULT 0, outcome TEXT,
             project_dir TEXT, created_at REAL NOT NULL,
-            consecutive_stalls INTEGER DEFAULT 0)""",
+            consecutive_stalls INTEGER DEFAULT 0,
+            consecutive_noops INTEGER DEFAULT 0)""",
         """CREATE TABLE IF NOT EXISTS learned_patterns (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             pattern_type TEXT NOT NULL, pattern_key TEXT NOT NULL,

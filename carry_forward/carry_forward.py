@@ -49,6 +49,7 @@ GIT_MIN_SESSIONS = 3
 STAGNATION_STALL_LIMIT = 3  # consecutive no-commit ticks before hard halt
 HALLUCINATION_LOOP_LIMIT = 3  # same files in N consecutive ticks = hallucination loop
 TEST_REGRESSION_THRESHOLD = 2  # drop of N+ tests in single tick = regression halt
+NOOP_LIMIT = 3  # consecutive no-op ticks before hard halt
 
 
 def _get_chain_stalls(session_id: str) -> int:
@@ -89,16 +90,17 @@ def _get_chain_stalls(session_id: str) -> int:
             # No git heads recorded -- can't determine, assume ok
             break
 
-        # Check if any project moved compared to the previous session in chain
-        if i > 0:
-            prev_heads = carry_conn.execute(
+        # Check if any project moved compared to parent (chain[i+1] is older/parent)
+        parent_idx = i + 1
+        if parent_idx < len(chain):
+            parent_heads = carry_conn.execute(
                 "SELECT project_dir, git_head FROM chain_git_heads WHERE session_id = ?",
-                (chain[i - 1],)
+                (chain[parent_idx],)
             ).fetchall()
-            prev_map = {d: h for d, h in prev_heads}
+            parent_map = {d: h for d, h in parent_heads}
             moved = False
             for d, h in heads:
-                if d in prev_map and prev_map[d] != h:
+                if d in parent_map and parent_map[d] != h:
                     moved = True
                     break
             if moved:
@@ -299,6 +301,106 @@ def _detect_test_regression(session_id: str) -> Tuple[bool, int, int, str]:
     return False, prev_count, curr_count, f"test count: {prev_count} -> {curr_count} (delta={delta})"
 
 
+def _count_consecutive_noops(session_id: str) -> int:
+    """Walk the parent chain and count consecutive no-op ticks.
+
+    A tick is a "no-op" if:
+    - No commit was made (git HEAD unchanged), AND
+    - No test count increase, AND
+    - Same files were edited as the previous tick (or no file changes recorded)
+
+    Returns the number of consecutive no-ops ending at the current session.
+    """
+    conn = get_conn()
+    carry_conn = get_carry_conn()
+
+    # Walk chain
+    chain = []
+    current = session_id
+    visited = set()
+    while current and current not in visited and len(chain) < 20:
+        visited.add(current)
+        row = conn.execute(
+            "SELECT id, parent_session_id FROM sessions WHERE id = ?", (current,)
+        ).fetchone()
+        if not row:
+            break
+        chain.append(row[0])
+        current = row[1]
+    conn.close()
+
+    if len(chain) < 2:
+        carry_conn.close()
+        return 0
+
+    noops = 0
+    for i, sid in enumerate(chain):
+        # Check git: did this session's commit differ from its parent?
+        # chain is [newest, ..., oldest]. Parent of chain[i] is chain[i+1].
+        git_heads = carry_conn.execute(
+            "SELECT project_dir, git_head FROM chain_git_heads WHERE session_id = ?",
+            (sid,)
+        ).fetchall()
+        parent_idx = i + 1
+        if parent_idx < len(chain):
+            parent_heads = carry_conn.execute(
+                "SELECT project_dir, git_head FROM chain_git_heads WHERE session_id = ?",
+                (chain[parent_idx],)
+            ).fetchall()
+            parent_map = {d: h for d, h in parent_heads}
+            git_moved = any(d in parent_map and parent_map[d] != h for d, h in git_heads)
+        else:
+            git_moved = False  # oldest session, no parent to compare
+
+        # Check test count: did it increase?
+        tc = carry_conn.execute(
+            "SELECT test_count FROM tick_test_counts WHERE session_id = ? ORDER BY tick_number DESC LIMIT 1",
+            (sid,)
+        ).fetchone()
+        if parent_idx < len(chain) and tc:
+            parent_tc = carry_conn.execute(
+                "SELECT test_count FROM tick_test_counts WHERE session_id = ? ORDER BY tick_number DESC LIMIT 1",
+                (chain[parent_idx],)
+            ).fetchone()
+            test_increased = (parent_tc and tc[0] > parent_tc[0])
+        else:
+            test_increased = False
+
+        # Productive if git moved OR tests increased
+        if git_moved or test_increased:
+            break  # Productive tick resets the counter
+
+        noops += 1
+
+    carry_conn.close()
+    return noops
+
+
+def _update_noop_counter(session_id: str, is_noop: bool) -> None:
+    """Update the consecutive_noops counter for a session in chain_meta."""
+    carry_conn = get_carry_conn()
+    existing = carry_conn.execute(
+        "SELECT consecutive_noops FROM chain_meta WHERE session_id = ?",
+        (session_id,)
+    ).fetchone()
+
+    if existing is not None:
+        new_count = (existing[0] + 1) if is_noop else 0
+        carry_conn.execute(
+            "UPDATE chain_meta SET consecutive_noops = ? WHERE session_id = ?",
+            (new_count, session_id)
+        )
+    else:
+        new_count = 1 if is_noop else 0
+        carry_conn.execute(
+            """INSERT INTO chain_meta (session_id, continuation_count, created_at, consecutive_stalls, consecutive_noops)
+               VALUES (?, 0, ?, 0, ?)""",
+            (session_id, time.time(), new_count)
+        )
+    carry_conn.commit()
+    carry_conn.close()
+
+
 def get_conn() -> sqlite3.Connection:
     return sqlite3.connect(DB_PATH)
 
@@ -323,7 +425,8 @@ def get_carry_conn() -> sqlite3.Connection:
             outcome TEXT,
             project_dir TEXT,
             created_at REAL NOT NULL,
-            consecutive_stalls INTEGER DEFAULT 0
+            consecutive_stalls INTEGER DEFAULT 0,
+            consecutive_noops INTEGER DEFAULT 0
         )
     """)
     conn.execute("""
@@ -760,11 +863,12 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
         7. Stagnation circuit breaker: consecutive_stalls >= limit and no active tools = halt
         8. Hallucination loop: same files edited in N consecutive ticks with no commit = halt
         9. Test regression: test count drops by more than threshold in single tick = halt
+        10. No-op loop: consecutive no-ops (no commit, no test increase) >= limit = halt
 
         Final: can_continue = not thrashing AND not blocker_halt
                AND not session_dead AND not (parent_dead AND own_tools==0)
                AND not stagnation_halt AND not hallucination_halt
-               AND not test_regression_halt
+               AND not test_regression_halt AND not noop_halt
     """
     thrashing, dead_count, chain_sessions, details = detect_thrash(session_id)
     git_ok, git_details = check_git_progress(session_id or "")
@@ -920,11 +1024,29 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
             test_regression_halt = True
             reasons.append(f"Test regression: {t_details}")
 
+    # Check 10: Consecutive no-op counter (v7)
+    # Unified metric: no commit AND no test increase = no-op.
+    # Hard halt after NOOP_LIMIT consecutive no-ops with no active tools.
+    noop_halt = False
+    consecutive_noops = _count_consecutive_noops(resolved_session_id or "")
+    is_noop = (git_stalled and not test_regression_halt)  # no commit and no test crash
+    _update_noop_counter(resolved_session_id or "", is_noop)
+    if consecutive_noops >= NOOP_LIMIT and own_tools == 0:
+        noop_halt = True
+        reasons.append(
+            f"No-op loop: {consecutive_noops} consecutive ticks with no commit or test increase"
+        )
+    elif consecutive_noops >= NOOP_LIMIT:
+        guard_rails.append(
+            f"No-op loop detected ({consecutive_noops} no-ops) but session is active"
+        )
+
     can_continue = (not thrashing and not blocker_halt and not session_dead
                     and not (parent_dead and own_tools == 0)
                     and not stagnation_halt
                     and not hallucination_halt
-                    and not test_regression_halt)
+                    and not test_regression_halt
+                    and not noop_halt)
 
     # v5: Log the decision for later outcome tracking
     # Dedup: don't log if we already logged this exact decision for this session recently (<300s)
@@ -972,6 +1094,8 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
         "test_regression_halt": test_regression_halt,
         "test_prev_count": test_prev_count,
         "test_curr_count": test_curr_count,
+        "noop_halt": noop_halt,
+        "consecutive_noops": consecutive_noops,
     }
 
 

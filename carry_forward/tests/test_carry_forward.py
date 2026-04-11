@@ -707,3 +707,102 @@ class TestTestRegression:
 
         result = patched_env.check_can_continue("tr_o1")
         assert result["test_regression_halt"] is True
+
+
+# ===========================================================================
+# Tests: Consecutive no-op counter (v7, Phase 4)
+# ===========================================================================
+
+class TestConsecutiveNoop:
+    """Tests for Phase 4: unified no-op detection."""
+
+    def test_3_noops_halts(self, state_db, carry_db, patched_env):
+        """3 consecutive no-op ticks with no tools should hard halt."""
+        insert_config(carry_db, "git_min_sessions", "2")
+
+        insert_session(state_db, "no_0", msgs=10, tools=5)
+        insert_session(state_db, "no_1", parent="no_0", msgs=10, tools=5)
+        insert_session(state_db, "no_2", parent="no_1", msgs=10, tools=5)
+        insert_session(state_db, "no_3", parent="no_2", msgs=1, tools=0)
+
+        # All same HEAD (no commits), no test counts
+        insert_git_heads(carry_db, "no_0", "/project", "aaa000")
+        insert_git_heads(carry_db, "no_1", "/project", "aaa000")
+        insert_git_heads(carry_db, "no_2", "/project", "aaa000")
+        insert_git_heads(carry_db, "no_3", "/project", "aaa000")
+
+        result = patched_env.check_can_continue("no_3")
+        assert result["can_continue"] is False
+        assert result["noop_halt"] is True
+        assert result["consecutive_noops"] >= 3
+        assert any("No-op loop" in r for r in result["reasons"])
+
+    def test_active_session_overrides_noop(self, state_db, carry_db, patched_env):
+        """No-op chain but session has tools -> guard rail, not halt."""
+        insert_config(carry_db, "git_min_sessions", "2")
+
+        insert_session(state_db, "no_a0", msgs=10, tools=5)
+        insert_session(state_db, "no_a1", parent="no_a0", msgs=10, tools=5)
+        insert_session(state_db, "no_a2", parent="no_a1", msgs=10, tools=5)
+        insert_session(state_db, "no_a3", parent="no_a2", msgs=10, tools=8)
+
+        insert_git_heads(carry_db, "no_a0", "/project", "bbb111")
+        insert_git_heads(carry_db, "no_a1", "/project", "bbb111")
+        insert_git_heads(carry_db, "no_a2", "/project", "bbb111")
+        insert_git_heads(carry_db, "no_a3", "/project", "bbb111")
+
+        result = patched_env.check_can_continue("no_a3")
+        assert result["can_continue"] is True
+        assert result["noop_halt"] is False
+        assert any("No-op loop detected" in gr for gr in result["guard_rails"])
+
+    def test_commit_resets_noop(self, state_db, carry_db, patched_env):
+        """A productive tick in the chain resets the no-op counter."""
+        insert_config(carry_db, "git_min_sessions", "2")
+
+        insert_session(state_db, "no_r0", msgs=10, tools=5)
+        insert_session(state_db, "no_r1", parent="no_r0", msgs=10, tools=5)
+        insert_session(state_db, "no_r2", parent="no_r1", msgs=10, tools=5)
+        insert_session(state_db, "no_r3", parent="no_r2", msgs=1, tools=0)
+
+        # no_r1 committed, no_r2 and no_r3 did not
+        insert_git_heads(carry_db, "no_r0", "/project", "old111")
+        insert_git_heads(carry_db, "no_r1", "/project", "new222")
+        insert_git_heads(carry_db, "no_r2", "/project", "new222")
+        insert_git_heads(carry_db, "no_r3", "/project", "new222")
+
+        result = patched_env.check_can_continue("no_r3")
+        assert result["noop_halt"] is False
+
+    def test_test_increase_resets_noop(self, state_db, carry_db, patched_env):
+        """Test count increase counts as productive even without commit."""
+        insert_config(carry_db, "git_min_sessions", "2")
+
+        insert_session(state_db, "no_t0", msgs=10, tools=5)
+        insert_session(state_db, "no_t1", parent="no_t0", msgs=10, tools=5)
+        insert_session(state_db, "no_t2", parent="no_t1", msgs=10, tools=5)
+        insert_session(state_db, "no_t3", parent="no_t2", msgs=1, tools=0)
+
+        # No commits (same HEAD)
+        insert_git_heads(carry_db, "no_t0", "/project", "ccc333")
+        insert_git_heads(carry_db, "no_t1", "/project", "ccc333")
+        insert_git_heads(carry_db, "no_t2", "/project", "ccc333")
+        insert_git_heads(carry_db, "no_t3", "/project", "ccc333")
+
+        # But no_t2 increased tests
+        insert_test_count(carry_db, "no_t0", 1, 100)
+        insert_test_count(carry_db, "no_t1", 2, 100)
+        insert_test_count(carry_db, "no_t2", 3, 105)
+        insert_test_count(carry_db, "no_t3", 4, 105)
+
+        result = patched_env.check_can_continue("no_t3")
+        # no_t2 was productive (tests increased), so no_t3 only has 1 no-op
+        assert result["noop_halt"] is False
+
+    def test_short_chain_no_noop(self, state_db, carry_db, patched_env):
+        """Single session should not trigger no-op."""
+        insert_session(state_db, "no_s0", msgs=10, tools=5)
+
+        result = patched_env.check_can_continue("no_s0")
+        assert result["noop_halt"] is False
+        assert result["consecutive_noops"] == 0
