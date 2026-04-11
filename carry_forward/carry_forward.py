@@ -687,22 +687,31 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
                     and not (parent_dead and own_tools == 0))
 
     # v5: Log the decision for later outcome tracking
+    # Dedup: don't log if we already logged this exact decision for this session recently (<300s)
     thresholds_used = {k: get_threshold(k) for k in DEFAULT_THRESHOLDS}
     decision_str = "continue" if can_continue else "halt"
     carry_conn2 = get_carry_conn()
-    carry_conn2.execute("""
-        INSERT INTO decision_log (session_id, decision, reasons_json, thresholds_json, can_continue, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        resolved_session_id,
-        decision_str,
-        json.dumps(reasons),
-        json.dumps(thresholds_used),
-        1 if can_continue else 0,
-        time.time(),
-    ))
-    decision_id = carry_conn2.execute("SELECT last_insert_rowid()").fetchone()[0]
-    carry_conn2.commit()
+    recent = carry_conn2.execute("""
+        SELECT id FROM decision_log 
+        WHERE session_id = ? AND decision = ? AND created_at > ?
+        LIMIT 1
+    """, (resolved_session_id, decision_str, time.time() - 300)).fetchone()
+    if not recent:
+        carry_conn2.execute("""
+            INSERT INTO decision_log (session_id, decision, reasons_json, thresholds_json, can_continue, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            resolved_session_id,
+            decision_str,
+            json.dumps(reasons),
+            json.dumps(thresholds_used),
+            1 if can_continue else 0,
+            time.time(),
+        ))
+        decision_id = carry_conn2.execute("SELECT last_insert_rowid()").fetchone()[0]
+        carry_conn2.commit()
+    else:
+        decision_id = recent[0]
     carry_conn2.close()
 
     return {
