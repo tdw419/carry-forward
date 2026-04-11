@@ -651,6 +651,58 @@ def cmd_should_continue(session_id: Optional[str] = None) -> None:
         sys.exit(0)
 
 
+def cmd_run(session_id: Optional[str] = None, json_output: bool = False) -> None:
+    """
+    Single entry point for automated loops.
+
+    Does three things in order:
+    1. Record outcome from previous session (if any)
+    2. Check can_continue
+    3. Print context for the next session
+
+    Exit codes:
+      0 = safe to continue, context printed
+      1 = halt (thrashing, blocker, dead session)
+      2 = halt with reason printed to stderr
+
+    Use --json for machine-readable output.
+    """
+    # Step 1: Record outcome from previous session
+    outcome = record_outcome(session_id)
+
+    # Step 2: Gate check
+    result = check_can_continue(session_id)
+
+    if not result["can_continue"]:
+        reason = ", ".join(result["reasons"])
+        if json_output:
+            print(json.dumps({
+                "action": "halt",
+                "reasons": result["reasons"],
+                "guard_rails": result.get("guard_rails", []),
+                "outcome": outcome,
+            }))
+        else:
+            print(f"HALT: {reason}")
+        sys.exit(1)
+
+    # Step 3: Print context for the next session
+    if json_output:
+        ctx = get_context_data(session_id, include_cron=False)
+        print(json.dumps({
+            "action": "continue",
+            "context": ctx,
+            "outcome": outcome,
+            "session_id": result.get("session_id"),
+        }, indent=2))
+    else:
+        print("CONTINUE")
+        print()
+        cmd_context(include_cron=False)
+
+    sys.exit(0)
+
+
 # ---------------------------------------------------------------------------
 # v5: Outcome recording
 # ---------------------------------------------------------------------------
@@ -1443,7 +1495,12 @@ def get_context_data(session_id: Optional[str] = None, include_cron: bool = Fals
     # Thrash detection
     thrashing, dead_count, _, thrash_details = detect_thrash(session_id)
 
-    # Learned insights
+    # Blockers
+    carry_conn = get_carry_conn()
+    blockers = [(r[0], r[1]) for r in carry_conn.execute(
+        "SELECT message, created_at FROM blockers WHERE resolved_at IS NULL"
+    ).fetchall()]
+    carry_conn.close()
 
     return {
         "session_id": sid,
@@ -1461,7 +1518,7 @@ def get_context_data(session_id: Optional[str] = None, include_cron: bool = Fals
         "chain_depth": chain_depth,
         "thrashing": thrashing,
         "thrash_details": thrash_details,
-        "can_continue": check_can_continue(sid),        "blockers": [{"message": m, "created": ts, "age_hours": (time.time() - ts) / 3600 if ts else None} for m, ts in blockers],
+        "blockers": [{"message": m, "created": ts, "age_hours": (time.time() - ts) / 3600 if ts else None} for m, ts in blockers],
     }
 
 
@@ -1517,6 +1574,10 @@ if __name__ == "__main__":
             print("Usage: carry_forward.py unblock <pattern>")
             sys.exit(1)
         cmd_unblock(" ".join(sys.argv[2:]))
+    elif cmd == "run":
+        sid = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else None
+        json_out = "--json" in sys.argv
+        cmd_run(sid, json_out)
     elif cmd == "should-continue":
         sid = sys.argv[2] if len(sys.argv) > 2 else None
         cmd_should_continue(sid)

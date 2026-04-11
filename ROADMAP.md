@@ -50,9 +50,9 @@ and stop the chain when it's clearly not making progress. Nothing more.
 
 **Goal:** A loop like chain_dev.py can use carry_forward in 3 lines.
 
-- [ ] Single entry point: `carry_forward.py run` that does context + should-continue + record-outcome
-- [ ] JSON output mode for programmatic consumption
-- [ ] Exit codes: 0=continue, 1=halt, 2=halt-with-reason
+- [x] Single entry point: `carry_forward.py run` that does context + should-continue + record-outcome
+- [x] JSON output mode for programmatic consumption (`--json`)
+- [x] Exit codes: 0=continue with context, 1=halt
 - [ ] Document the integration pattern (how a cron loop wires it up)
 
 ## Phase 5: Prove It Works
