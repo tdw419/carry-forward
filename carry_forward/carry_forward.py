@@ -46,6 +46,92 @@ DEAD_LOOKBACK = 5
 ORPHAN_CHILD_THRESHOLD = 10
 BLOCKER_HALT_HOURS = 4.0
 GIT_MIN_SESSIONS = 3
+STAGNATION_STALL_LIMIT = 3  # consecutive no-commit ticks before hard halt
+
+
+def _get_chain_stalls(session_id: str) -> int:
+    """Walk the parent chain and count consecutive sessions with no git progress.
+
+    Returns the number of consecutive stalls (0 if latest session had a commit).
+    """
+    conn = get_conn()
+    carry_conn = get_carry_conn()
+
+    # Walk chain to get ordered list (oldest first)
+    chain = []
+    current = session_id
+    visited = set()
+    while current and current not in visited and len(chain) < 20:
+        visited.add(current)
+        conn_row = conn.execute(
+            "SELECT id, parent_session_id FROM sessions WHERE id = ?", (current,)
+        ).fetchone()
+        if not conn_row:
+            break
+        chain.append(conn_row[0])
+        current = conn_row[1]
+    conn.close()
+
+    if not chain:
+        carry_conn.close()
+        return 0
+
+    # Walk from newest to oldest, counting consecutive stalls
+    stalls = 0
+    for i, sid in enumerate(chain):
+        heads = carry_conn.execute(
+            "SELECT project_dir, git_head FROM chain_git_heads WHERE session_id = ?",
+            (sid,)
+        ).fetchall()
+        if not heads:
+            # No git heads recorded -- can't determine, assume ok
+            break
+
+        # Check if any project moved compared to the previous session in chain
+        if i > 0:
+            prev_heads = carry_conn.execute(
+                "SELECT project_dir, git_head FROM chain_git_heads WHERE session_id = ?",
+                (chain[i - 1],)
+            ).fetchall()
+            prev_map = {d: h for d, h in prev_heads}
+            moved = False
+            for d, h in heads:
+                if d in prev_map and prev_map[d] != h:
+                    moved = True
+                    break
+            if moved:
+                break  # Commit found -- stop counting
+
+        stalls += 1
+
+    carry_conn.close()
+    return stalls
+
+
+def _update_stall_counter(session_id: str, stalled: bool) -> None:
+    """Update the consecutive_stalls counter for a session in chain_meta."""
+    carry_conn = get_carry_conn()
+    existing = carry_conn.execute(
+        "SELECT consecutive_stalls FROM chain_meta WHERE session_id = ?",
+        (session_id,)
+    ).fetchone()
+
+    if existing is not None:
+        new_count = (existing[0] + 1) if stalled else 0
+        carry_conn.execute(
+            "UPDATE chain_meta SET consecutive_stalls = ? WHERE session_id = ?",
+            (new_count, session_id)
+        )
+    else:
+        new_count = 1 if stalled else 0
+        carry_conn.execute(
+            """INSERT INTO chain_meta (session_id, continuation_count, created_at, consecutive_stalls)
+               VALUES (?, 0, ?, ?)""",
+            (session_id, time.time(), new_count)
+        )
+    carry_conn.commit()
+    carry_conn.close()
+
 
 def get_conn() -> sqlite3.Connection:
     return sqlite3.connect(DB_PATH)
@@ -70,7 +156,8 @@ def get_carry_conn() -> sqlite3.Connection:
             continuation_count INTEGER DEFAULT 0,
             outcome TEXT,
             project_dir TEXT,
-            created_at REAL NOT NULL
+            created_at REAL NOT NULL,
+            consecutive_stalls INTEGER DEFAULT 0
         )
     """)
     conn.execute("""
@@ -474,9 +561,11 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
         5. Session dead (0 tools AND <=2 msgs = halt)
         5b. Parent dead + current session also dead = halt
         6. Git stall + dead session combo (informational)
+        7. Stagnation circuit breaker: consecutive_stalls >= limit and no active tools = halt
 
         Final: can_continue = not thrashing AND not blocker_halt
                AND not session_dead AND not (parent_dead AND own_tools==0)
+               AND not stagnation_halt
     """
     thrashing, dead_count, chain_sessions, details = detect_thrash(session_id)
     git_ok, git_details = check_git_progress(session_id or "")
@@ -577,11 +666,29 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
     if git_stalled and session_dead:
         reasons.append("Git stalled + dead session: no progress and no activity")
 
+    # Check 7: Stagnation circuit breaker (v7)
+    # Count consecutive ticks with no commits across the chain. If >= limit, hard halt.
+    # Active session override: if this session has tool calls, don't halt (might be mid-commit).
+    stagnation_halt = False
+    consecutive_stalls = _get_chain_stalls(resolved_session_id or "")
+    if git_stalled and consecutive_stalls >= STAGNATION_STALL_LIMIT and own_tools == 0:
+        stagnation_halt = True
+        reasons.append(
+            f"Stagnation: {consecutive_stalls} consecutive ticks with no commits"
+        )
+    elif git_stalled and consecutive_stalls >= STAGNATION_STALL_LIMIT:
+        guard_rails.append(
+            f"Stagnation detected ({consecutive_stalls} stalls) but session is active"
+        )
+    # Update the stall counter in chain_meta
+    _update_stall_counter(resolved_session_id or "", git_stalled)
+
     # Final decision: continue only if ALL halt checks pass.
     # Exception: if the current session itself has tool calls, it's productive
     # regardless of parent state -- don't kill a live session for a dead parent.
     can_continue = (not thrashing and not blocker_halt and not session_dead
-                    and not (parent_dead and own_tools == 0))
+                    and not (parent_dead and own_tools == 0)
+                    and not stagnation_halt)
 
     # v5: Log the decision for later outcome tracking
     # Dedup: don't log if we already logged this exact decision for this session recently (<300s)
@@ -622,6 +729,8 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
         "parent_dead": parent_dead,
         "thrash_details": details,
         "decision_id": decision_id,
+        "stagnation_halt": stagnation_halt,
+        "consecutive_stalls": consecutive_stalls,
     }
 
 
