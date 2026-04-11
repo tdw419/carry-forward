@@ -1396,6 +1396,69 @@ def git_status(project_dir: str) -> Dict[str, Any]:
     return result
 
 
+# Project state files to look for (in order of priority)
+PROJECT_STATE_FILES = ["ROADMAP.md", "NORTH_STAR.md", "TODO.md", "NEXT.md", "PLAN.md"]
+
+
+def read_project_state(project_dir: str) -> Dict[str, Any]:
+    """
+    Read project state files (ROADMAP.md, etc.) from a project directory.
+    Returns dict with file contents and git diff stat.
+    """
+    state = {"dir": project_dir, "files": {}, "git_diff_stat": None}
+
+    # Read state files
+    for filename in PROJECT_STATE_FILES:
+        filepath = os.path.join(project_dir, filename)
+        if os.path.isfile(filepath):
+            try:
+                with open(filepath, "r") as f:
+                    content = f.read()
+                if content.strip():
+                    state["files"][filename] = content[:3000]  # cap at 3K chars
+            except (PermissionError, OSError):
+                pass
+
+    # Check parent dirs too (project root may be above the detected dir)
+    check_dir = project_dir
+    for _ in range(3):
+        parent = os.path.dirname(check_dir)
+        if parent == check_dir or not parent:
+            break
+        for filename in PROJECT_STATE_FILES:
+            if filename not in state["files"]:
+                filepath = os.path.join(parent, filename)
+                if os.path.isfile(filepath):
+                    try:
+                        with open(filepath, "r") as f:
+                            content = f.read()
+                        if content.strip():
+                            state["files"][filename] = content[:3000]
+                    except (PermissionError, OSError):
+                        pass
+        check_dir = parent
+
+    # Git diff stat (what changed recently)
+    git_dir = project_dir
+    while git_dir and git_dir != "/":
+        if os.path.isdir(os.path.join(git_dir, ".git")):
+            break
+        git_dir = os.path.dirname(git_dir)
+    
+    if git_dir and git_dir != "/":
+        try:
+            r = subprocess.run(
+                ["git", "diff", "--stat", "HEAD~5..HEAD"],
+                capture_output=True, text=True, cwd=git_dir, timeout=5
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                state["git_diff_stat"] = r.stdout.strip()[:2000]
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+
+    return state
+
+
 def cmd_status(session_id: Optional[str] = None) -> None:
     """Show git-aware project state for projects detected from a session."""
     conn = get_conn()
@@ -1714,6 +1777,23 @@ def cmd_context(include_cron: bool = False) -> None:
                         print(f"    {c}")
                 if gs.get("dirty"):
                     print(f"    DIRTY: {len(gs.get('dirty_files', []))} uncommitted changes")
+
+            # Read project state files (ROADMAP.md, etc.)
+            ps = read_project_state(d)
+            if ps.get("files"):
+                print(f"  PROJECT STATE:")
+                for fname, content in ps["files"].items():
+                    # Show first 20 lines of each file
+                    lines = content.splitlines()[:20]
+                    print(f"    --- {fname} ---")
+                    for line in lines:
+                        print(f"    {line}")
+                    if len(content.splitlines()) > 20:
+                        print(f"    ... ({len(content.splitlines())} lines total)")
+            if ps.get("git_diff_stat"):
+                print(f"  RECENT CHANGES (HEAD~5..HEAD):")
+                for line in ps["git_diff_stat"].splitlines()[:10]:
+                    print(f"    {line}")
         print()
 
     # Show session chain depth
