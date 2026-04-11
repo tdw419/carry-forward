@@ -23,13 +23,13 @@ Catches the BGT problem -- agent edits same files repeatedly without progress.
 ## Phase 3: Test Count Regression
 Catches agents deleting tests to make suites pass.
 
-- [ ] Add `tick_test_counts` table (session_id, tick_number, test_count, source)
-- [ ] Record test count before and after each tick (grep `def test_` or `#[test]`)
-- [ ] New check: if test_count drops by more than 2 in a single tick, hard halt
-- [ ] Informational: if test_count unchanged for 5 ticks but ROADMAP has test items, warn
-- [ ] Test: count drops by 5 triggers halt
-- [ ] Test: count drops by 1 (refactor) does not trigger
-- [ ] Test: count increases is fine
+- [x] Add `tick_test_counts` table (session_id, tick_number, test_count, source)
+- [x] Record test count before and after each tick (grep `def test_` or `#[test]`)
+- [x] New check: if test_count drops by more than 2 in a single tick, hard halt
+- [x] Informational: if test_count unchanged for 5 ticks but ROADMAP has test items, warn
+- [x] Test: count drops by 5 triggers halt
+- [x] Test: count drops by 1 (refactor) does not trigger
+- [x] Test: count increases is fine
 
 ## Phase 4: Consecutive No-Op Counter
 Unified metric that subsumes Phase 1 and Phase 2.

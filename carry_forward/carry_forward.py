@@ -48,6 +48,7 @@ BLOCKER_HALT_HOURS = 4.0
 GIT_MIN_SESSIONS = 3
 STAGNATION_STALL_LIMIT = 3  # consecutive no-commit ticks before hard halt
 HALLUCINATION_LOOP_LIMIT = 3  # same files in N consecutive ticks = hallucination loop
+TEST_REGRESSION_THRESHOLD = 2  # drop of N+ tests in single tick = regression halt
 
 
 def _get_chain_stalls(session_id: str) -> int:
@@ -222,6 +223,82 @@ def _detect_hallucination_loop(session_id: str, lookback: int = 3) -> Tuple[bool
     return True, sorted(common), f"same {len(common)} file(s) edited in {lookback} consecutive ticks with no commit"
 
 
+def record_test_count(session_id: str, tick_number: int, test_count: int,
+                      source: str = "unknown") -> None:
+    """Record the test count at the end of a tick.
+
+    Called after each tick. test_count is the total number of tests found.
+    source indicates how the count was obtained (e.g. 'pytest', 'cargo', 'grep').
+    """
+    carry_conn = get_carry_conn()
+    carry_conn.execute("""
+        INSERT INTO tick_test_counts (session_id, tick_number, test_count, source, recorded_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (session_id, tick_number, test_count, source, time.time()))
+    carry_conn.commit()
+    carry_conn.close()
+
+
+def _detect_test_regression(session_id: str) -> Tuple[bool, int, int, str]:
+    """Check if test count dropped significantly between the last two ticks.
+
+    Returns:
+        is_regression: True if test count dropped by more than threshold.
+        prev_count: Test count from the previous tick.
+        curr_count: Test count from the current (latest) tick.
+        details: Human-readable description.
+    """
+    carry_conn = get_carry_conn()
+
+    # Get the two most recent test counts for sessions in this chain
+    # Walk chain to find parent
+    conn = get_conn()
+    chain = []
+    current = session_id
+    visited = set()
+    while current and current not in visited and len(chain) < 20:
+        visited.add(current)
+        row = conn.execute(
+            "SELECT id, parent_session_id FROM sessions WHERE id = ?", (current,)
+        ).fetchone()
+        if not row:
+            break
+        chain.append(row[0])
+        current = row[1]
+    conn.close()
+
+    if len(chain) < 2:
+        carry_conn.close()
+        return False, 0, 0, "need at least 2 sessions for test regression check"
+
+    # Get test counts for the two most recent sessions
+    rows = []
+    for sid in chain[:2]:
+        r = carry_conn.execute(
+            "SELECT test_count, source FROM tick_test_counts WHERE session_id = ? ORDER BY tick_number DESC LIMIT 1",
+            (sid,)
+        ).fetchone()
+        if r:
+            rows.append((r[0], r[1]))
+
+    carry_conn.close()
+
+    if len(rows) < 2:
+        return False, 0, 0, "need test counts for at least 2 sessions"
+
+    curr_count, curr_source = rows[0]
+    prev_count, prev_source = rows[1]
+    delta = prev_count - curr_count  # positive means tests were removed
+
+    if delta > TEST_REGRESSION_THRESHOLD:
+        return True, prev_count, curr_count, (
+            f"test count dropped by {delta} ({prev_count} -> {curr_count}) "
+            f"in single tick [{curr_source}]"
+        )
+
+    return False, prev_count, curr_count, f"test count: {prev_count} -> {curr_count} (delta={delta})"
+
+
 def get_conn() -> sqlite3.Connection:
     return sqlite3.connect(DB_PATH)
 
@@ -276,6 +353,21 @@ def get_carry_conn() -> sqlite3.Connection:
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_tick_files_session
         ON tick_file_changes(session_id)
+    """)
+    # v7: Test count tracking -- detect test deletion/suppression
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tick_test_counts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            tick_number INTEGER NOT NULL,
+            test_count INTEGER NOT NULL,
+            source TEXT NOT NULL DEFAULT 'unknown',
+            recorded_at REAL NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_test_counts_session
+        ON tick_test_counts(session_id)
     """)
     # v5: Decision logging -- every check_can_continue call gets recorded
     conn.execute("""
@@ -667,10 +759,12 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
         6. Git stall + dead session combo (informational)
         7. Stagnation circuit breaker: consecutive_stalls >= limit and no active tools = halt
         8. Hallucination loop: same files edited in N consecutive ticks with no commit = halt
+        9. Test regression: test count drops by more than threshold in single tick = halt
 
         Final: can_continue = not thrashing AND not blocker_halt
                AND not session_dead AND not (parent_dead AND own_tools==0)
                AND not stagnation_halt AND not hallucination_halt
+               AND not test_regression_halt
     """
     thrashing, dead_count, chain_sessions, details = detect_thrash(session_id)
     git_ok, git_details = check_git_progress(session_id or "")
@@ -811,10 +905,26 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
     # Final decision: continue only if ALL halt checks pass.
     # Exception: if the current session itself has tool calls, it's productive
     # regardless of parent state -- don't kill a live session for a dead parent.
+
+    # Check 9: Test count regression (v7)
+    # If test count dropped by more than threshold in a single tick, hard halt.
+    # This catches agents deleting tests to make suites pass.
+    test_regression_halt = False
+    test_prev_count = 0
+    test_curr_count = 0
+    if resolved_session_id:
+        t_reg, t_prev, t_curr, t_details = _detect_test_regression(resolved_session_id)
+        test_prev_count = t_prev
+        test_curr_count = t_curr
+        if t_reg:
+            test_regression_halt = True
+            reasons.append(f"Test regression: {t_details}")
+
     can_continue = (not thrashing and not blocker_halt and not session_dead
                     and not (parent_dead and own_tools == 0)
                     and not stagnation_halt
-                    and not hallucination_halt)
+                    and not hallucination_halt
+                    and not test_regression_halt)
 
     # v5: Log the decision for later outcome tracking
     # Dedup: don't log if we already logged this exact decision for this session recently (<300s)
@@ -859,6 +969,9 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
         "consecutive_stalls": consecutive_stalls,
         "hallucination_halt": hallucination_halt,
         "hallucination_files": hallucination_files,
+        "test_regression_halt": test_regression_halt,
+        "test_prev_count": test_prev_count,
+        "test_curr_count": test_curr_count,
     }
 
 

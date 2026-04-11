@@ -12,7 +12,7 @@ import pytest
 
 # Ensure conftest helpers are importable
 sys.path.insert(0, os.path.dirname(__file__))
-from conftest import insert_session, insert_blocker, insert_git_heads, insert_config, insert_chain, insert_tick_changes  # noqa: E402
+from conftest import insert_session, insert_blocker, insert_git_heads, insert_config, insert_chain, insert_tick_changes, insert_test_count  # noqa: E402
 
 
 # ===========================================================================
@@ -620,3 +620,90 @@ class TestHallucinationLoop:
 
         result = patched_env.check_can_continue("hl_n2")
         assert result["hallucination_halt"] is False
+
+
+# ===========================================================================
+# Tests: Test count regression (v7, Phase 3)
+# ===========================================================================
+
+class TestTestRegression:
+    """Tests for Phase 3: test count drop detection."""
+
+    def test_big_drop_halts(self, state_db, carry_db, patched_env):
+        """Test count drops by 5 in single tick should hard halt."""
+        insert_session(state_db, "tr_0", msgs=10, tools=5)
+        insert_session(state_db, "tr_1", parent="tr_0", msgs=10, tools=5)
+
+        insert_test_count(carry_db, "tr_0", 1, 100)
+        insert_test_count(carry_db, "tr_1", 2, 95)
+
+        result = patched_env.check_can_continue("tr_1")
+        assert result["can_continue"] is False
+        assert result["test_regression_halt"] is True
+        assert result["test_prev_count"] == 100
+        assert result["test_curr_count"] == 95
+        assert any("Test regression" in r for r in result["reasons"])
+
+    def test_small_drop_continues(self, state_db, carry_db, patched_env):
+        """Test count drops by 1 (refactor) should not halt."""
+        insert_session(state_db, "tr_s0", msgs=10, tools=5)
+        insert_session(state_db, "tr_s1", parent="tr_s0", msgs=10, tools=5)
+
+        insert_test_count(carry_db, "tr_s0", 1, 100)
+        insert_test_count(carry_db, "tr_s1", 2, 99)
+
+        result = patched_env.check_can_continue("tr_s1")
+        assert result["can_continue"] is True
+        assert result["test_regression_halt"] is False
+
+    def test_increase_continues(self, state_db, carry_db, patched_env):
+        """Test count increasing is always fine."""
+        insert_session(state_db, "tr_i0", msgs=10, tools=5)
+        insert_session(state_db, "tr_i1", parent="tr_i0", msgs=10, tools=5)
+
+        insert_test_count(carry_db, "tr_i0", 1, 100)
+        insert_test_count(carry_db, "tr_i1", 2, 120)
+
+        result = patched_env.check_can_continue("tr_i1")
+        assert result["can_continue"] is True
+        assert result["test_regression_halt"] is False
+
+    def test_no_data_no_regression(self, state_db, carry_db, patched_env):
+        """No test count data should not trigger regression."""
+        insert_session(state_db, "tr_n0", msgs=10, tools=5)
+        insert_session(state_db, "tr_n1", parent="tr_n0", msgs=10, tools=5)
+
+        # No insert_test_count calls
+
+        result = patched_env.check_can_continue("tr_n1")
+        assert result["test_regression_halt"] is False
+
+    def test_single_session_no_regression(self, state_db, carry_db, patched_env):
+        """Single session with test count should not trigger regression."""
+        insert_session(state_db, "tr_ss", msgs=10, tools=5)
+        insert_test_count(carry_db, "tr_ss", 1, 50)
+
+        result = patched_env.check_can_continue("tr_ss")
+        assert result["test_regression_halt"] is False
+
+    def test_exact_threshold_no_halt(self, state_db, carry_db, patched_env):
+        """Drop of exactly 2 (the threshold) should NOT halt (> not >=)."""
+        insert_session(state_db, "tr_e0", msgs=10, tools=5)
+        insert_session(state_db, "tr_e1", parent="tr_e0", msgs=10, tools=5)
+
+        insert_test_count(carry_db, "tr_e0", 1, 50)
+        insert_test_count(carry_db, "tr_e1", 2, 48)
+
+        result = patched_env.check_can_continue("tr_e1")
+        assert result["test_regression_halt"] is False
+
+    def test_one_above_threshold_halts(self, state_db, carry_db, patched_env):
+        """Drop of 3 (threshold + 1) should halt."""
+        insert_session(state_db, "tr_o0", msgs=10, tools=5)
+        insert_session(state_db, "tr_o1", parent="tr_o0", msgs=10, tools=5)
+
+        insert_test_count(carry_db, "tr_o0", 1, 50)
+        insert_test_count(carry_db, "tr_o1", 2, 47)
+
+        result = patched_env.check_can_continue("tr_o1")
+        assert result["test_regression_halt"] is True

@@ -79,6 +79,12 @@ def _create_carry_db(path):
             files_changed_json TEXT NOT NULL,
             committed INTEGER NOT NULL DEFAULT 0,
             recorded_at REAL NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS tick_test_counts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL, tick_number INTEGER NOT NULL,
+            test_count INTEGER NOT NULL,
+            source TEXT NOT NULL DEFAULT 'unknown',
+            recorded_at REAL NOT NULL)""",
     ]:
         conn.execute(ddl)
     conn.commit()
@@ -173,6 +179,17 @@ def insert_tick_changes(carry_db, session_id, tick_number, files, committed=Fals
     conn.execute(
         "INSERT INTO tick_file_changes (session_id, tick_number, files_changed_json, committed, recorded_at) VALUES (?, ?, ?, ?, ?)",
         (session_id, tick_number, json.dumps(sorted(files)), 1 if committed else 0, time.time())
+    )
+    conn.commit()
+    conn.close()
+
+
+def insert_test_count(carry_db, session_id, tick_number, test_count, source="pytest"):
+    """Insert test count for a tick."""
+    conn = sqlite3.connect(carry_db)
+    conn.execute(
+        "INSERT INTO tick_test_counts (session_id, tick_number, test_count, source, recorded_at) VALUES (?, ?, ?, ?, ?)",
+        (session_id, tick_number, test_count, source, time.time())
     )
     conn.commit()
     conn.close()
