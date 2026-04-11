@@ -47,6 +47,7 @@ ORPHAN_CHILD_THRESHOLD = 10
 BLOCKER_HALT_HOURS = 4.0
 GIT_MIN_SESSIONS = 3
 STAGNATION_STALL_LIMIT = 3  # consecutive no-commit ticks before hard halt
+HALLUCINATION_LOOP_LIMIT = 3  # same files in N consecutive ticks = hallucination loop
 
 
 def _get_chain_stalls(session_id: str) -> int:
@@ -133,6 +134,94 @@ def _update_stall_counter(session_id: str, stalled: bool) -> None:
     carry_conn.close()
 
 
+def record_tick_changes(session_id: str, tick_number: int, files_changed: List[str],
+                        committed: bool) -> None:
+    """Record which files changed in a tick for hallucination loop detection.
+
+    Called after each tick completes. files_changed is a list of file paths
+    relative to the project root. committed is True if the tick produced a commit.
+    """
+    carry_conn = get_carry_conn()
+    carry_conn.execute("""
+        INSERT INTO tick_file_changes (session_id, tick_number, files_changed_json, committed, recorded_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (session_id, tick_number, json.dumps(sorted(files_changed)),
+          1 if committed else 0, time.time()))
+    carry_conn.commit()
+    carry_conn.close()
+
+
+def _detect_hallucination_loop(session_id: str, lookback: int = 3) -> Tuple[bool, List[str], str]:
+    """Check if the agent is editing the same files repeatedly without progress.
+
+    Walks the parent chain backwards, looking at the last `lookback` ticks.
+    If the same file(s) appear in all of them with no commit, it's a hallucination loop.
+
+    Returns:
+        is_loop: True if hallucination loop detected.
+        common_files: The files that appear in every tick.
+        details: Human-readable description.
+    """
+    conn = get_conn()
+    carry_conn = get_carry_conn()
+
+    # Walk chain to get recent sessions
+    chain = []
+    current = session_id
+    visited = set()
+    while current and current not in visited and len(chain) < 20:
+        visited.add(current)
+        row = conn.execute(
+            "SELECT id, parent_session_id FROM sessions WHERE id = ?", (current,)
+        ).fetchone()
+        if not row:
+            break
+        chain.append(row[0])
+        current = row[1]
+    conn.close()
+
+    if len(chain) < lookback:
+        carry_conn.close()
+        return False, [], f"chain too short ({len(chain)}) for hallucination check"
+
+    # Get file changes for the most recent `lookback` sessions
+    recent_sessions = chain[:lookback]
+    tick_data = []
+    for sid in recent_sessions:
+        rows = carry_conn.execute(
+            "SELECT files_changed_json, committed FROM tick_file_changes WHERE session_id = ? ORDER BY tick_number DESC LIMIT 1",
+            (sid,)
+        ).fetchall()
+        if rows:
+            files = json.loads(rows[0][0])
+            committed = bool(rows[0][1])
+            tick_data.append((files, committed))
+        else:
+            # No data for this session -- can't be part of a loop
+            carry_conn.close()
+            return False, [], f"no file change data for session {sid}"
+
+    carry_conn.close()
+
+    # If any tick in the window committed, it's not a hallucination loop
+    if any(committed for _, committed in tick_data):
+        return False, [], "at least one tick in window committed"
+
+    # Find files that appear in ALL ticks
+    file_sets = [set(files) for files, _ in tick_data]
+    if not file_sets:
+        return False, [], "no file data"
+
+    common = file_sets[0]
+    for fs in file_sets[1:]:
+        common = common & fs
+
+    if not common:
+        return False, [], "different files in each tick (no loop)"
+
+    return True, sorted(common), f"same {len(common)} file(s) edited in {lookback} consecutive ticks with no commit"
+
+
 def get_conn() -> sqlite3.Connection:
     return sqlite3.connect(DB_PATH)
 
@@ -172,6 +261,21 @@ def get_carry_conn() -> sqlite3.Connection:
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_chain_git_session
         ON chain_git_heads(session_id)
+    """)
+    # v7: Tick file changes -- track which files changed per tick for hallucination loop detection
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tick_file_changes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            tick_number INTEGER NOT NULL,
+            files_changed_json TEXT NOT NULL,
+            committed INTEGER NOT NULL DEFAULT 0,
+            recorded_at REAL NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_tick_files_session
+        ON tick_file_changes(session_id)
     """)
     # v5: Decision logging -- every check_can_continue call gets recorded
     conn.execute("""
@@ -562,10 +666,11 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
         5b. Parent dead + current session also dead = halt
         6. Git stall + dead session combo (informational)
         7. Stagnation circuit breaker: consecutive_stalls >= limit and no active tools = halt
+        8. Hallucination loop: same files edited in N consecutive ticks with no commit = halt
 
         Final: can_continue = not thrashing AND not blocker_halt
                AND not session_dead AND not (parent_dead AND own_tools==0)
-               AND not stagnation_halt
+               AND not stagnation_halt AND not hallucination_halt
     """
     thrashing, dead_count, chain_sessions, details = detect_thrash(session_id)
     git_ok, git_details = check_git_progress(session_id or "")
@@ -683,12 +788,33 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
     # Update the stall counter in chain_meta
     _update_stall_counter(resolved_session_id or "", git_stalled)
 
+    # Check 8: Hallucination loop detection (v7)
+    # If the same files are being edited across multiple ticks with no commits,
+    # the agent is stuck in a loop. Hard halt if limit reached, guard rail if 2 ticks.
+    hallucination_halt = False
+    hallucination_files = []
+    if resolved_session_id:
+        h_loop, h_files, h_details = _detect_hallucination_loop(resolved_session_id)
+        if h_loop and own_tools == 0:
+            hallucination_halt = True
+            hallucination_files = h_files
+            reasons.append(
+                f"Hallucination loop: same {len(h_files)} file(s) in {HALLUCINATION_LOOP_LIMIT}+ ticks "
+                f"with no commit ({', '.join(h_files[:3])})"
+            )
+        elif h_loop:
+            hallucination_files = h_files
+            guard_rails.append(
+                f"Hallucination loop detected ({h_details}) but session is active"
+            )
+
     # Final decision: continue only if ALL halt checks pass.
     # Exception: if the current session itself has tool calls, it's productive
     # regardless of parent state -- don't kill a live session for a dead parent.
     can_continue = (not thrashing and not blocker_halt and not session_dead
                     and not (parent_dead and own_tools == 0)
-                    and not stagnation_halt)
+                    and not stagnation_halt
+                    and not hallucination_halt)
 
     # v5: Log the decision for later outcome tracking
     # Dedup: don't log if we already logged this exact decision for this session recently (<300s)
@@ -731,6 +857,8 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
         "decision_id": decision_id,
         "stagnation_halt": stagnation_halt,
         "consecutive_stalls": consecutive_stalls,
+        "hallucination_halt": hallucination_halt,
+        "hallucination_files": hallucination_files,
     }
 
 

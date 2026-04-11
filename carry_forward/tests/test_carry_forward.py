@@ -12,7 +12,7 @@ import pytest
 
 # Ensure conftest helpers are importable
 sys.path.insert(0, os.path.dirname(__file__))
-from conftest import insert_session, insert_blocker, insert_git_heads, insert_config, insert_chain  # noqa: E402
+from conftest import insert_session, insert_blocker, insert_git_heads, insert_config, insert_chain, insert_tick_changes  # noqa: E402
 
 
 # ===========================================================================
@@ -515,3 +515,108 @@ class TestStagnationCircuitBreaker:
         result = patched_env.check_can_continue("stag_n2")
         assert "consecutive_stalls" in result
         assert result["consecutive_stalls"] >= 2
+
+
+# ===========================================================================
+# Tests: Hallucination loop detection (v7, Phase 2)
+# ===========================================================================
+
+class TestHallucinationLoop:
+    """Tests for Phase 2: same files edited repeatedly with no commits."""
+
+    def test_loop_3_ticks_same_file_halts(self, state_db, carry_db, patched_env):
+        """Same file in 3 consecutive ticks with no commits should halt."""
+        insert_session(state_db, "hl_0", msgs=5, tools=2)
+        insert_session(state_db, "hl_1", parent="hl_0", msgs=5, tools=2)
+        insert_session(state_db, "hl_2", parent="hl_1", msgs=1, tools=0)
+
+        # All three touched the same file, none committed
+        insert_tick_changes(carry_db, "hl_0", 1, ["src/vm.rs"])
+        insert_tick_changes(carry_db, "hl_1", 2, ["src/vm.rs"])
+        insert_tick_changes(carry_db, "hl_2", 3, ["src/vm.rs"])
+
+        result = patched_env.check_can_continue("hl_2")
+        assert result["can_continue"] is False
+        assert result["hallucination_halt"] is True
+        assert "src/vm.rs" in result["hallucination_files"]
+        assert any("Hallucination loop" in r for r in result["reasons"])
+
+    def test_loop_active_session_continues(self, state_db, carry_db, patched_env):
+        """Loop detected but session has tools -> guard rail, not halt."""
+        insert_session(state_db, "hl_a0", msgs=5, tools=2)
+        insert_session(state_db, "hl_a1", parent="hl_a0", msgs=5, tools=2)
+        insert_session(state_db, "hl_a2", parent="hl_a1", msgs=10, tools=5)
+
+        insert_tick_changes(carry_db, "hl_a0", 1, ["src/lib.rs"])
+        insert_tick_changes(carry_db, "hl_a1", 2, ["src/lib.rs"])
+        insert_tick_changes(carry_db, "hl_a2", 3, ["src/lib.rs"])
+
+        result = patched_env.check_can_continue("hl_a2")
+        assert result["can_continue"] is True
+        assert result["hallucination_halt"] is False
+        assert any("Hallucination loop detected" in gr for gr in result["guard_rails"])
+
+    def test_different_files_no_loop(self, state_db, carry_db, patched_env):
+        """Different files each tick -> no hallucination loop."""
+        insert_session(state_db, "hl_d0", msgs=5, tools=2)
+        insert_session(state_db, "hl_d1", parent="hl_d0", msgs=5, tools=2)
+        insert_session(state_db, "hl_d2", parent="hl_d1", msgs=5, tools=3)
+
+        insert_tick_changes(carry_db, "hl_d0", 1, ["src/a.rs"])
+        insert_tick_changes(carry_db, "hl_d1", 2, ["src/b.rs"])
+        insert_tick_changes(carry_db, "hl_d2", 3, ["src/c.rs"])
+
+        result = patched_env.check_can_continue("hl_d2")
+        assert result["hallucination_halt"] is False
+        assert result["can_continue"] is True
+
+    def test_commit_breaks_loop(self, state_db, carry_db, patched_env):
+        """If one tick in the window committed, no loop detection."""
+        insert_session(state_db, "hl_c0", msgs=5, tools=2)
+        insert_session(state_db, "hl_c1", parent="hl_c0", msgs=5, tools=2)
+        insert_session(state_db, "hl_c2", parent="hl_c1", msgs=1, tools=0)
+
+        # Same file, but middle tick committed
+        insert_tick_changes(carry_db, "hl_c0", 1, ["src/main.rs"])
+        insert_tick_changes(carry_db, "hl_c1", 2, ["src/main.rs"], committed=True)
+        insert_tick_changes(carry_db, "hl_c2", 3, ["src/main.rs"])
+
+        result = patched_env.check_can_continue("hl_c2")
+        assert result["hallucination_halt"] is False
+
+    def test_multiple_common_files(self, state_db, carry_db, patched_env):
+        """Multiple files common across all ticks should all be reported."""
+        insert_session(state_db, "hl_m0", msgs=5, tools=2)
+        insert_session(state_db, "hl_m1", parent="hl_m0", msgs=5, tools=2)
+        insert_session(state_db, "hl_m2", parent="hl_m1", msgs=1, tools=0)
+
+        insert_tick_changes(carry_db, "hl_m0", 1, ["src/a.rs", "src/b.rs"])
+        insert_tick_changes(carry_db, "hl_m1", 2, ["src/a.rs", "src/b.rs", "src/c.rs"])
+        insert_tick_changes(carry_db, "hl_m2", 3, ["src/a.rs", "src/b.rs"])
+
+        result = patched_env.check_can_continue("hl_m2")
+        assert result["hallucination_halt"] is True
+        assert "src/a.rs" in result["hallucination_files"]
+        assert "src/b.rs" in result["hallucination_files"]
+        # src/c.rs only in one tick, not common
+        assert "src/c.rs" not in result["hallucination_files"]
+
+    def test_short_chain_no_loop(self, state_db, carry_db, patched_env):
+        """Chain shorter than lookback should not trigger hallucination check."""
+        insert_session(state_db, "hl_s0", msgs=5, tools=2)
+
+        insert_tick_changes(carry_db, "hl_s0", 1, ["src/x.rs"])
+
+        result = patched_env.check_can_continue("hl_s0")
+        assert result["hallucination_halt"] is False
+
+    def test_no_tick_data_no_loop(self, state_db, carry_db, patched_env):
+        """Sessions without tick_file_changes data should not trigger loop."""
+        insert_session(state_db, "hl_n0", msgs=5, tools=2)
+        insert_session(state_db, "hl_n1", parent="hl_n0", msgs=5, tools=2)
+        insert_session(state_db, "hl_n2", parent="hl_n1", msgs=1, tools=0)
+
+        # No insert_tick_changes calls
+
+        result = patched_env.check_can_continue("hl_n2")
+        assert result["hallucination_halt"] is False

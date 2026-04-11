@@ -13,12 +13,12 @@ The biggest token-saver. Promotes git_stalled from informational to hard halt.
 ## Phase 2: Hallucination Loop Detection
 Catches the BGT problem -- agent edits same files repeatedly without progress.
 
-- [ ] Add `tick_file_changes` table (session_id, tick_number, files_changed_json, committed bool)
-- [ ] After each tick, record `git diff --name-only HEAD~1..HEAD` (if commit) or `git diff --name-only` (if no commit)
-- [ ] New check: look at last 3 ticks. If same file(s) appear in all 3 with no commit, add halt reason
-- [ ] Guard rail (not hard halt): if same files edited 2 ticks in a row, warn but continue
-- [ ] Test: 3 ticks touching same file with no commit triggers halt
-- [ ] Test: different files each tick does not trigger
+- [x] Add `tick_file_changes` table (session_id, tick_number, files_changed_json, committed bool)
+- [x] After each tick, record `git diff --name-only HEAD~1..HEAD` (if commit) or `git diff --name-only` (if no commit)
+- [x] New check: look at last 3 ticks. If same file(s) appear in all 3 with no commit, add halt reason
+- [x] Guard rail (not hard halt): if same files edited 2 ticks in a row, warn but continue
+- [x] Test: 3 ticks touching same file with no commit triggers halt
+- [x] Test: different files each tick does not trigger
 
 ## Phase 3: Test Count Regression
 Catches agents deleting tests to make suites pass.
