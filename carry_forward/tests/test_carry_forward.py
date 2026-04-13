@@ -12,7 +12,7 @@ import pytest
 
 # Ensure conftest helpers are importable
 sys.path.insert(0, os.path.dirname(__file__))
-from conftest import insert_session, insert_blocker, insert_git_heads, insert_config, insert_chain, insert_tick_changes, insert_test_count, insert_decision, insert_outcome  # noqa: E402
+from conftest import insert_session, insert_blocker, insert_git_heads, insert_config, insert_chain, insert_tick_changes, insert_test_count, insert_decision, insert_outcome, insert_lesson  # noqa: E402
 
 
 # ===========================================================================
@@ -1012,3 +1012,265 @@ class TestCmdShowConfig:
         output = capsys.readouterr().out
         assert "noop_limit = 5" in output
         assert "source: calibration" in output
+
+
+# ===========================================================================
+# Tests: Phase 6 -- Learned lessons from outcome history
+# ===========================================================================
+
+class TestExtractLessons:
+    """Tests for extract_lessons() -- analyzing outcomes to produce lessons."""
+
+    def test_no_outcomes_returns_empty(self, carry_db, patched_env):
+        """No outcomes means no lessons."""
+        result = patched_env.extract_lessons()
+        assert result == []
+
+    def test_too_few_outcomes_returns_empty(self, carry_db, patched_env):
+        """Less than 3 outcomes means no lessons."""
+        dec_id = insert_decision(carry_db, "s1", "continue", True)
+        insert_outcome(carry_db, dec_id, "s1", productive=1)
+        result = patched_env.extract_lessons()
+        assert result == []
+
+    def test_bad_continues_generates_lesson(self, carry_db, patched_env):
+        """3+ unproductive continues should generate a continue_accuracy lesson."""
+        for i in range(4):
+            dec_id = insert_decision(
+                carry_db, f"bad_cont_{i}", "continue", True,
+                reasons=["Thrash: too many dead sessions"]
+            )
+            insert_outcome(carry_db, dec_id, f"bad_cont_{i}", productive=0)
+
+        result = patched_env.extract_lessons()
+        assert len(result) >= 1
+        categories = [l["category"] for l in result]
+        assert "continue_accuracy" in categories
+
+    def test_wrong_halts_generates_lesson(self, carry_db, patched_env):
+        """3+ productive sessions that were halted should generate a halt_accuracy lesson."""
+        for i in range(4):
+            dec_id = insert_decision(
+                carry_db, f"wrong_halt_{i}", "halt", False,
+                reasons=["Session dead: 0 tools and <=2 messages"]
+            )
+            insert_outcome(carry_db, dec_id, f"wrong_halt_{i}", productive=1, tool_calls=5)
+
+        result = patched_env.extract_lessons()
+        assert len(result) >= 1
+        categories = [l["category"] for l in result]
+        assert "halt_accuracy" in categories
+
+    def test_low_productivity_overall_lesson(self, carry_db, patched_env):
+        """10+ outcomes with >60% unproductive should generate an overall_productivity lesson."""
+        # 7 unproductive, 3 productive = 70% unproductive
+        for i in range(7):
+            dec_id = insert_decision(carry_db, f"unprod_{i}", "continue", True)
+            insert_outcome(carry_db, dec_id, f"unprod_{i}", productive=0)
+        for i in range(3):
+            dec_id = insert_decision(carry_db, f"prod_{i}", "continue", True)
+            insert_outcome(carry_db, dec_id, f"prod_{i}", productive=1)
+
+        result = patched_env.extract_lessons()
+        categories = [l["category"] for l in result]
+        assert "overall_productivity" in categories
+        lesson_text = [l["lesson"] for l in result if l["category"] == "overall_productivity"][0]
+        assert "smaller steps" in lesson_text
+
+    def test_high_productivity_overall_lesson(self, carry_db, patched_env):
+        """10+ outcomes with >85% productive should generate a positive lesson."""
+        # 9 productive, 1 unproductive = 90% productive
+        for i in range(9):
+            dec_id = insert_decision(carry_db, f"hprod_{i}", "continue", True)
+            insert_outcome(carry_db, dec_id, f"hprod_{i}", productive=1)
+        dec_id = insert_decision(carry_db, "hunprod_0", "continue", True)
+        insert_outcome(carry_db, dec_id, "hunprod_0", productive=0)
+
+        result = patched_env.extract_lessons()
+        categories = [l["category"] for l in result]
+        assert "overall_productivity" in categories
+        lesson_text = [l["lesson"] for l in result if l["category"] == "overall_productivity"][0]
+        assert "thresholds are working" in lesson_text
+
+    def test_git_pattern_lesson(self, carry_db, patched_env):
+        """5+ productive sessions with no git move should generate a git_pattern lesson."""
+        for i in range(6):
+            dec_id = insert_decision(carry_db, f"gitless_{i}", "continue", True)
+            insert_outcome(carry_db, dec_id, f"gitless_{i}", productive=1, git_moved=0)
+
+        result = patched_env.extract_lessons()
+        categories = [l["category"] for l in result]
+        assert "git_pattern" in categories
+        lesson_text = [l["lesson"] for l in result if l["category"] == "git_pattern"][0]
+        assert "uncommitted work" in lesson_text
+
+    def test_lessons_stored_in_db(self, carry_db, patched_env):
+        """Extracted lessons should be persisted in the lessons table."""
+        for i in range(4):
+            dec_id = insert_decision(
+                carry_db, f"store_{i}", "continue", True,
+                reasons=["Thrash: dead sessions"]
+            )
+            insert_outcome(carry_db, dec_id, f"store_{i}", productive=0)
+
+        patched_env.extract_lessons()
+
+        # Verify lessons are in the DB
+        conn = sqlite3.connect(carry_db)
+        rows = conn.execute("SELECT lesson, category FROM lessons").fetchall()
+        conn.close()
+        assert len(rows) >= 1
+
+    def test_repeated_extraction_increments_hit_count(self, carry_db, patched_env):
+        """Running extract_lessons twice should increment hit_count on existing lessons."""
+        for i in range(4):
+            dec_id = insert_decision(
+                carry_db, f"repeat_{i}", "continue", True,
+                reasons=["Thrash: dead sessions"]
+            )
+            insert_outcome(carry_db, dec_id, f"repeat_{i}", productive=0)
+
+        patched_env.extract_lessons()
+        patched_env.extract_lessons()
+
+        conn = sqlite3.connect(carry_db)
+        rows = conn.execute("SELECT hit_count FROM lessons").fetchall()
+        conn.close()
+        assert any(r[0] >= 2 for r in rows)
+
+
+class TestGetTopLessons:
+    """Tests for get_top_lessons() -- retrieving ranked lessons."""
+
+    def test_empty_db_returns_empty(self, carry_db, patched_env):
+        """No lessons stored returns empty list."""
+        result = patched_env.get_top_lessons()
+        assert result == []
+
+    def test_returns_top_n(self, carry_db, patched_env):
+        """Should return at most n lessons."""
+        insert_lesson(carry_db, "Lesson A", hit_count=5)
+        insert_lesson(carry_db, "Lesson B", hit_count=3)
+        insert_lesson(carry_db, "Lesson C", hit_count=1)
+
+        result = patched_env.get_top_lessons(n=2)
+        assert len(result) == 2
+        assert result[0]["lesson"] == "Lesson A"
+        assert result[1]["lesson"] == "Lesson B"
+
+    def test_ranked_by_hit_count(self, carry_db, patched_env):
+        """Lessons should be ranked by hit_count descending."""
+        insert_lesson(carry_db, "Low hit", hit_count=1)
+        insert_lesson(carry_db, "High hit", hit_count=10)
+        insert_lesson(carry_db, "Med hit", hit_count=5)
+
+        result = patched_env.get_top_lessons(n=3)
+        assert result[0]["hit_count"] == 10
+        assert result[1]["hit_count"] == 5
+        assert result[2]["hit_count"] == 1
+
+    def test_returns_dict_structure(self, carry_db, patched_env):
+        """Each lesson should have the expected dict keys."""
+        insert_lesson(carry_db, "Test lesson", category="test_cat", evidence="some evidence")
+        result = patched_env.get_top_lessons(n=1)
+        assert len(result) == 1
+        assert "lesson" in result[0]
+        assert "category" in result[0]
+        assert "evidence" in result[0]
+        assert "hit_count" in result[0]
+
+    def test_default_n_is_3(self, carry_db, patched_env):
+        """Default n=3 should return at most 3 lessons."""
+        for i in range(5):
+            insert_lesson(carry_db, f"Lesson {i}", hit_count=5 - i)
+        result = patched_env.get_top_lessons()
+        assert len(result) == 3
+
+
+class TestLessonsInContext:
+    """Tests that lessons appear in context command output."""
+
+    def test_lessons_appear_in_cmd_context(self, state_db, carry_db, patched_env, capsys):
+        """cmd_context should include LEARNED LESSONS section when lessons exist."""
+        insert_session(state_db, "ctx_sess", msgs=10, tools=5)
+        insert_lesson(carry_db, "This project fails on vm.rs changes", category="file_pattern",
+                       evidence="3/5 failures involved vm.rs", hit_count=4)
+
+        # Need messages for the session
+        conn = sqlite3.connect(state_db)
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+            ("ctx_sess", "user", "Do the thing")
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+            ("ctx_sess", "assistant", "Done doing the thing")
+        )
+        conn.commit()
+        conn.close()
+
+        patched_env.cmd_context()
+        output = capsys.readouterr().out
+        assert "LEARNED LESSONS" in output
+        assert "vm.rs" in output
+
+    def test_no_lessons_no_section(self, state_db, carry_db, patched_env, capsys):
+        """cmd_context should not show LEARNED LESSONS when no lessons exist."""
+        insert_session(state_db, "ctx_noless", msgs=10, tools=5)
+        conn = sqlite3.connect(state_db)
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+            ("ctx_noless", "user", "Do the thing")
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+            ("ctx_noless", "assistant", "Done")
+        )
+        conn.commit()
+        conn.close()
+
+        patched_env.cmd_context()
+        output = capsys.readouterr().out
+        assert "LEARNED LESSONS" not in output
+
+    def test_lessons_in_get_context_data(self, state_db, carry_db, patched_env):
+        """get_context_data should include learned_lessons key."""
+        insert_session(state_db, "api_sess", msgs=10, tools=5)
+        insert_lesson(carry_db, "Test lesson from API", hit_count=2)
+
+        result = patched_env.get_context_data("api_sess")
+        assert "learned_lessons" in result
+        assert len(result["learned_lessons"]) == 1
+        assert result["learned_lessons"][0]["lesson"] == "Test lesson from API"
+
+    def test_max_3_lessons_in_context(self, state_db, carry_db, patched_env):
+        """Context should show at most 3 lessons."""
+        insert_session(state_db, "api_sess_3", msgs=10, tools=5)
+        for i in range(5):
+            insert_lesson(carry_db, f"Lesson {i}", hit_count=5 - i)
+
+        result = patched_env.get_context_data("api_sess_3")
+        assert len(result["learned_lessons"]) <= 3
+
+
+class TestCmdLearn:
+    """Tests for the 'learn' CLI command."""
+
+    def test_learn_no_outcomes(self, carry_db, patched_env, capsys):
+        """learn with no outcomes should say so."""
+        patched_env.cmd_learn()
+        output = capsys.readouterr().out
+        assert "No lessons extracted" in output
+
+    def test_learn_with_outcomes(self, carry_db, patched_env, capsys):
+        """learn with enough outcomes should print lessons."""
+        for i in range(4):
+            dec_id = insert_decision(
+                carry_db, f"learn_{i}", "continue", True,
+                reasons=["Thrash: dead sessions"]
+            )
+            insert_outcome(carry_db, dec_id, f"learn_{i}", productive=0)
+
+        patched_env.cmd_learn()
+        output = capsys.readouterr().out
+        assert "LEARNED LESSONS" in output

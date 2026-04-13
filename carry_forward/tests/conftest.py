@@ -20,7 +20,8 @@ def _create_state_db(path):
             message_count INTEGER DEFAULT 0,
             tool_call_count INTEGER DEFAULT 0,
             started_at REAL,
-            model TEXT
+            model TEXT,
+            title TEXT
         )
     """)
     conn.execute("""
@@ -28,7 +29,8 @@ def _create_state_db(path):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT,
             role TEXT,
-            content TEXT
+            content TEXT,
+            timestamp REAL
         )
     """)
     conn.commit()
@@ -86,6 +88,14 @@ def _create_carry_db(path):
             test_count INTEGER NOT NULL,
             source TEXT NOT NULL DEFAULT 'unknown',
             recorded_at REAL NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS lessons (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lesson TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'general',
+            evidence TEXT,
+            hit_count INTEGER DEFAULT 1,
+            last_hit REAL NOT NULL,
+            created_at REAL NOT NULL)""",
     ]:
         conn.execute(ddl)
     conn.commit()
@@ -216,6 +226,17 @@ def insert_outcome(carry_db, decision_id, session_id, productive=1, git_moved=0,
     conn.execute(
         "INSERT INTO decision_outcomes (decision_id, session_id, outcome_productive, outcome_git_moved, outcome_chain_continued, outcome_tool_calls, outcome_message_count, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (decision_id, session_id, productive, git_moved, chain_continued, tool_calls, messages, time.time())
+    )
+    conn.commit()
+    conn.close()
+
+
+def insert_lesson(carry_db, lesson, category="general", evidence="", hit_count=1):
+    """Insert a lesson into the lessons table."""
+    conn = sqlite3.connect(carry_db)
+    conn.execute(
+        "INSERT INTO lessons (lesson, category, evidence, hit_count, last_hit, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (lesson, category, evidence, hit_count, time.time(), time.time())
     )
     conn.commit()
     conn.close()

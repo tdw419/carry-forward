@@ -575,6 +575,18 @@ def get_carry_conn() -> sqlite3.Connection:
             updated_at REAL NOT NULL
         )
     """)
+    # v6: Learned lessons -- extracted from outcome history for context enrichment
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS lessons (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lesson TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'general',
+            evidence TEXT,
+            hit_count INTEGER DEFAULT 1,
+            last_hit REAL NOT NULL,
+            created_at REAL NOT NULL
+        )
+    """)
     conn.commit()
     return conn
 
@@ -1438,6 +1450,211 @@ def auto_record_outcomes() -> None:
 
 
 # ---------------------------------------------------------------------------
+# v6: Learned lessons from outcome history
+# ---------------------------------------------------------------------------
+
+
+def extract_lessons() -> List[Dict[str, Any]]:
+    """Analyze outcome history and extract actionable lessons.
+
+    Lessons are patterns like "this project fails on vm.rs changes" or
+    "halts on hallucination loops are usually wrong". These get surfaced
+    in the context command so the next session can learn from past failures.
+
+    Returns list of lesson dicts with 'lesson', 'category', 'evidence' keys.
+    """
+    carry_conn = get_carry_conn()
+
+    # Join decisions with outcomes
+    rows = carry_conn.execute("""
+        SELECT dl.session_id, dl.decision, dl.can_continue,
+               dl.reasons_json,
+               do_out.outcome_productive, do_out.outcome_git_moved,
+               do_out.outcome_tool_calls, do_out.outcome_message_count,
+               do_out.checked_at
+        FROM decision_outcomes do_out
+        JOIN decision_log dl ON do_out.decision_id = dl.id
+        ORDER BY do_out.checked_at DESC
+        LIMIT 200
+    """).fetchall()
+    carry_conn.close()
+
+    if len(rows) < 3:
+        return []
+
+    new_lessons = []
+
+    # --- Lesson type 1: Continue decisions that were unproductive ---
+    bad_continues = [(r[0], r[3], r[7]) for r in rows
+                     if r[2] == 1 and r[4] == 0]  # continued but not productive
+    if len(bad_continues) >= 3:
+        # Look for common halt reasons in these
+        reason_counts: Dict[str, int] = {}
+        for _, reasons_json, tool_calls in bad_continues:
+            try:
+                reasons = json.loads(reasons_json) if reasons_json else []
+            except (json.JSONDecodeError, TypeError):
+                reasons = []
+            for reason in reasons:
+                # Normalize: extract key phrase
+                tag = reason.split(":")[0].strip() if ":" in reason else reason.strip()
+                reason_counts[tag] = reason_counts.get(tag, 0) + 1
+
+        if reason_counts:
+            top_reason = max(reason_counts, key=reason_counts.get)
+            count = reason_counts[top_reason]
+            lesson_text = (f"Continue decisions often lead to unproductive sessions "
+                           f"when {top_reason.lower()} is flagged -- consider tightening")
+            new_lessons.append({
+                "lesson": lesson_text,
+                "category": "continue_accuracy",
+                "evidence": f"{count}/{len(bad_continues)} bad continues with {top_reason}",
+            })
+
+    # --- Lesson type 2: Halt decisions that were wrong (session was productive) ---
+    wrong_halts = [(r[0], r[3], r[7]) for r in rows
+                   if r[2] == 0 and r[4] == 1]  # halted but was productive
+    if len(wrong_halts) >= 3:
+        reason_counts2: Dict[str, int] = {}
+        for _, reasons_json, _ in wrong_halts:
+            try:
+                reasons = json.loads(reasons_json) if reasons_json else []
+            except (json.JSONDecodeError, TypeError):
+                reasons = []
+            for reason in reasons:
+                tag = reason.split(":")[0].strip() if ":" in reason else reason.strip()
+                reason_counts2[tag] = reason_counts2.get(tag, 0) + 1
+
+        if reason_counts2:
+            top_reason2 = max(reason_counts2, key=reason_counts2.get)
+            count2 = reason_counts2[top_reason2]
+            lesson_text2 = (f"Halt decisions for {top_reason2.lower()} are often wrong "
+                            f"-- the session was actually productive")
+            new_lessons.append({
+                "lesson": lesson_text2,
+                "category": "halt_accuracy",
+                "evidence": f"{count2}/{len(wrong_halts)} wrong halts triggered by {top_reason2}",
+            })
+
+    # --- Lesson type 3: Overall productivity pattern ---
+    total = len(rows)
+    productive = sum(1 for r in rows if r[4])
+    unproductive = total - productive
+    if total >= 10:
+        if unproductive / total > 0.6:
+            new_lessons.append({
+                "lesson": f"Only {productive}/{total} sessions are productive -- "
+                          f"use smaller steps and verify before committing",
+                "category": "overall_productivity",
+                "evidence": f"{unproductive} unproductive out of {total} recent sessions",
+            })
+        elif productive / total > 0.85:
+            new_lessons.append({
+                "lesson": f"High productivity rate ({productive}/{total}) -- "
+                          f"current thresholds are working well",
+                "category": "overall_productivity",
+                "evidence": f"{productive} productive out of {total} recent sessions",
+            })
+
+    # --- Lesson type 4: Git-specific pattern ---
+    no_git_move = sum(1 for r in rows if r[4] == 1 and r[5] == 0)  # productive but no git move
+    if no_git_move >= 5:
+        new_lessons.append({
+            "lesson": "Productive sessions often don't commit -- "
+                      "check for uncommitted work before assuming failure",
+            "category": "git_pattern",
+            "evidence": f"{no_git_move} productive sessions with no git HEAD movement",
+        })
+
+    # Store/update lessons in DB
+    now = time.time()
+    carry_conn2 = get_carry_conn()
+    for lesson in new_lessons:
+        # Check if similar lesson already exists (by category + first 50 chars)
+        existing = carry_conn2.execute(
+            "SELECT id, hit_count FROM lessons WHERE category = ? AND lesson LIKE ?",
+            (lesson["category"], f"{lesson['lesson'][:50]}%")
+        ).fetchone()
+
+        if existing:
+            # Update hit count and last_hit
+            carry_conn2.execute(
+                "UPDATE lessons SET hit_count = ?, last_hit = ?, evidence = ? WHERE id = ?",
+                (existing[1] + 1, now, lesson.get("evidence", ""), existing[0])
+            )
+        else:
+            carry_conn2.execute(
+                "INSERT INTO lessons (lesson, category, evidence, hit_count, last_hit, created_at) "
+                "VALUES (?, ?, ?, 1, ?, ?)",
+                (lesson["lesson"], lesson["category"], lesson.get("evidence", ""), now, now)
+            )
+
+    carry_conn2.commit()
+    carry_conn2.close()
+
+    return new_lessons
+
+
+def get_top_lessons(n: int = 3) -> List[Dict[str, Any]]:
+    """Return the top N lessons from the lessons table, ranked by hit_count and recency.
+
+    Args:
+        n: Max number of lessons to return (default 3).
+
+    Returns:
+        List of dicts with 'lesson', 'category', 'evidence', 'hit_count' keys.
+    """
+    carry_conn = get_carry_conn()
+
+    # Check if lessons table exists (handles fresh DBs)
+    try:
+        rows = carry_conn.execute("""
+            SELECT lesson, category, evidence, hit_count, last_hit
+            FROM lessons
+            ORDER BY hit_count DESC, last_hit DESC
+            LIMIT ?
+        """, (n,)).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+
+    carry_conn.close()
+
+    return [
+        {
+            "lesson": r[0],
+            "category": r[1],
+            "evidence": r[2],
+            "hit_count": r[3],
+        }
+        for r in rows
+    ]
+
+
+def cmd_learn() -> None:
+    """Analyze outcome history and print extracted lessons."""
+    lessons = extract_lessons()
+
+    if not lessons:
+        print("No lessons extracted -- need at least 3 outcomes with patterns.")
+        return
+
+    print(f"=== LEARNED LESSONS ({len(lessons)} new/updated) ===\n")
+    for i, lesson in enumerate(lessons, 1):
+        print(f"  [{i}] {lesson['lesson']}")
+        print(f"      category: {lesson['category']}")
+        if lesson.get("evidence"):
+            print(f"      evidence: {lesson['evidence']}")
+        print()
+
+    # Also show top stored lessons
+    top = get_top_lessons(n=5)
+    if top:
+        print("TOP STORED LESSONS:")
+        for i, lesson in enumerate(top, 1):
+            print(f"  {i}. {lesson['lesson']} (hits: {lesson['hit_count']})")
+
+
+# ---------------------------------------------------------------------------
 # v5: Calibration
 # ---------------------------------------------------------------------------
 
@@ -2156,6 +2373,16 @@ def cmd_context(include_cron: bool = False) -> None:
             print(f"  [{ts_str}] {msg}")
         print()
 
+    # v6: Learned lessons from outcome history
+    lessons = get_top_lessons(n=3)
+    if lessons:
+        print("=== LEARNED LESSONS ===")
+        for lesson in lessons:
+            print(f"  - {lesson['lesson']}")
+            if lesson.get("evidence"):
+                print(f"    ({lesson['evidence']})")
+        print()
+
 
 # ---------------------------------------------------------------------------
 # Command: roadmap
@@ -2359,6 +2586,7 @@ def get_context_data(session_id: Optional[str] = None, include_cron: bool = Fals
         "thrash_details": thrash_details,
         "blockers": [{"message": m, "created": ts, "age_hours": (time.time() - ts) / 3600 if ts else None} for m, ts in blockers],
         "roadmaps": roadmap_data,
+        "learned_lessons": get_top_lessons(n=3),
     }
 
 
@@ -2443,6 +2671,9 @@ if __name__ == "__main__":
 
     elif cmd == "show-config":
         cmd_show_config()
+
+    elif cmd == "learn":
+        cmd_learn()
 
     elif cmd == "roadmap":
         sid = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else None
