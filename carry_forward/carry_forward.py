@@ -22,6 +22,7 @@ Usage:
     carry_forward.py record-outcome [SESSION_ID]  # Record outcome of a past decision
     carry_forward.py calibrate                    # Auto-tune thresholds from decision history
     carry_forward.py show-config                  # Show current threshold values
+    carry_forward.py roadmap                      # Show roadmap progress for detected projects
 """
 import sqlite3
 import subprocess
@@ -32,6 +33,10 @@ import json
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from roadmap_integration import (
+    scan_project_roadmaps, format_roadmap_context, roadmap_completion_signal,
+    HAS_ROADMAP_BUILDER,
+)
 
 DB_PATH = "/home/jericho/.hermes/state.db"
 CARRY_DB_PATH = os.path.expanduser("~/.hermes/carry_forward.db")
@@ -1041,6 +1046,31 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
             f"No-op loop detected ({consecutive_noops} no-ops) but session is active"
         )
 
+    # Check 11: Roadmap completion signal (informational)
+    # If all roadmaps for tracked projects are complete, that's a natural stop signal.
+    # This is NOT a hard halt -- just a guard rail suggesting the loop has achieved its goal.
+    roadmap_signal = {"all_complete": False, "any_in_progress": False, "details": "no roadmaps found"}
+    if HAS_ROADMAP_BUILDER and resolved_session_id:
+        # Get project dirs from session
+        conn_road = get_conn()
+        road_texts = conn_road.execute("""
+            SELECT content FROM messages WHERE session_id = ? AND role IN ('user', 'assistant', 'tool')
+        """, (resolved_session_id,)).fetchall()
+        conn_road.close()
+        all_text_road = " ".join(r[0] or "" for r in road_texts)
+        road_paths = set(re.findall(r"/home/jericho/[a-zA-Z0-9_/.-]+\.[a-z]{1,4}", all_text_road))
+        road_dirs = sorted(set(p.rsplit("/", 1)[0] for p in road_paths))[:10]
+        if road_dirs:
+            roadmaps_found = scan_project_roadmaps(road_dirs)
+            roadmap_signal = roadmap_completion_signal(roadmaps_found)
+            if roadmap_signal["all_complete"]:
+                guard_rails.append(
+                    f"Roadmap complete: {roadmap_signal['details']} -- natural stopping point"
+                )
+            elif roadmap_signal["any_in_progress"]:
+                # Positive signal -- there's still work to do
+                pass  # silently continue
+
     can_continue = (not thrashing and not blocker_halt and not session_dead
                     and not (parent_dead and own_tools == 0)
                     and not stagnation_halt
@@ -1096,6 +1126,7 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
         "test_curr_count": test_curr_count,
         "noop_halt": noop_halt,
         "consecutive_noops": consecutive_noops,
+        "roadmap_signal": roadmap_signal,
     }
 
 
@@ -1787,7 +1818,16 @@ def cmd_context(include_cron: bool = False) -> None:
 
     # Detect project paths and show git status
     all_text = " ".join(r[1] or "" for r in rows)
-    paths = set(re.findall(r"/home/jericho/[a-zA-Z0-9_/.-]+\.[a-z]{1,4}", all_text))
+    # Also include tool messages for better path detection
+    conn_tool = get_conn()
+    tool_rows = conn_tool.execute("""
+        SELECT content FROM messages
+        WHERE session_id = ? AND role = 'tool'
+    """, (session_id,)).fetchall()
+    conn_tool.close()
+    tool_text = " ".join(r[0] or "" for r in tool_rows)
+    combined_text = all_text + " " + tool_text
+    paths = set(re.findall(r"/home/jericho/[a-zA-Z0-9_/.-]+\.[a-z]{1,4}", combined_text))
     dirs = sorted(set(p.rsplit("/", 1)[0] for p in paths))[:10]
 
     if dirs:
@@ -1821,6 +1861,14 @@ def cmd_context(include_cron: bool = False) -> None:
                 for line in ps["git_diff_stat"].splitlines()[:10]:
                     print(f"    {line}")
         print()
+
+    # Roadmap progress (if roadmap_builder is available)
+    if HAS_ROADMAP_BUILDER:
+        roadmaps = scan_project_roadmaps(dirs)
+        roadmap_text = format_roadmap_context(roadmaps)
+        if roadmap_text:
+            print("=== ROADMAP PROGRESS ===")
+            print(roadmap_text)
 
     # Show session chain depth
     carry_conn = get_carry_conn()
@@ -1870,7 +1918,77 @@ def cmd_context(include_cron: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Command: roadmap
+# ---------------------------------------------------------------------------
+
+def cmd_roadmap(session_id: Optional[str] = None) -> None:
+    """Show roadmap progress for projects detected from a session."""
+    if not HAS_ROADMAP_BUILDER:
+        print("roadmap_builder not installed. pip install -e ~/zion/projects/roadmap_builder/roadmap_builder/")
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    if not session_id:
+        cur.execute("""
+            SELECT id FROM sessions
+            WHERE message_count > 5 AND source IN ('cli', 'telegram', 'whatsapp')
+            ORDER BY started_at DESC LIMIT 1
+        """)
+        row = cur.fetchone()
+        session_id = row[0] if row else None
+
+    if not session_id:
+        print("No session found.")
+        conn.close()
+        return
+
+    # Extract project dirs from session
+    cur.execute("""
+        SELECT content FROM messages WHERE session_id = ? AND role IN ('user', 'assistant', 'tool')
+    """, (session_id,))
+    all_text = " ".join(r[0] or "" for r in cur.fetchall())
+    conn.close()
+
+    paths = set(re.findall(r"/home/jericho/[a-zA-Z0-9_/.-]+\.[a-z]{1,4}", all_text))
+    dirs = sorted(set(p.rsplit("/", 1)[0] for p in paths))[:10]
+
+    roadmaps = scan_project_roadmaps(dirs)
+    if not roadmaps:
+        print("No roadmaps found for tracked projects.")
+        print(f"  Scanned: {', '.join(dirs[:5])}")
+        return
+
+    print("=== ROADMAP PROGRESS ===")
+    print()
+    for r in roadmaps:
+        bar_len = 30
+        filled = int(bar_len * r["deliverables_done"] / max(r["deliverables_total"], 1))
+        bar = "#" * filled + "-" * (bar_len - filled)
+        print(f"  {r['title']}")
+        print(f"  [{bar}] {r['progress_pct']}%")
+        print(f"  Phases: {r['phases_complete']}/{r['phases_total']} complete | "
+              f"Deliverables: {r['deliverables_done']}/{r['deliverables_total']} done")
+        print(f"  File: {r['roadmap_file']}")
+
+        cp = r.get("current_phase")
+        if cp:
+            print(f"  Current: {cp['id']} -- {cp['title']} [{cp['status']}]")
+            if cp.get("goal"):
+                print(f"  Goal: {cp['goal'][:150]}")
+
+        nd = r.get("next_deliverables", [])
+        if nd:
+            print("  Next deliverables:")
+            for d in nd:
+                status_mark = "~" if d["status"] == "in_progress" else " "
+                print(f"    [{status_mark}] {d['name']}: {d['description'][:80]}")
+        print()
+
+
+# ---------------------------------------------------------------------------
+# Main (CLI router)
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -1976,6 +2094,13 @@ def get_context_data(session_id: Optional[str] = None, include_cron: bool = Fals
     ).fetchall()]
     carry_conn.close()
 
+    # Roadmap data (if available)
+    roadmap_data = []
+    if HAS_ROADMAP_BUILDER:
+        roadmap_data = scan_project_roadmaps(
+            [p.get("git_root", "") for p in projects if p.get("git_root")]
+        )
+
     return {
         "session_id": sid,
         "title": title,
@@ -1993,6 +2118,7 @@ def get_context_data(session_id: Optional[str] = None, include_cron: bool = Fals
         "thrashing": thrashing,
         "thrash_details": thrash_details,
         "blockers": [{"message": m, "created": ts, "age_hours": (time.time() - ts) / 3600 if ts else None} for m, ts in blockers],
+        "roadmaps": roadmap_data,
     }
 
 
@@ -2071,6 +2197,9 @@ if __name__ == "__main__":
         result = record_outcome(sid)
         print(json.dumps(result, indent=2))
 
+    elif cmd == "roadmap":
+        sid = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else None
+        cmd_roadmap(sid)
 
     else:
         print(f"Unknown command: {cmd}")
