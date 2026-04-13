@@ -106,6 +106,17 @@ PROJECT_TYPE_DEFAULTS = {
     "java": {"stagnation_stall_limit": 5, "noop_limit": 4, "hallucination_loop_limit": 4},
 }
 
+# Test commands by project type (Phase 8).
+# Maps detected project type to the test command the agent should run.
+TEST_COMMAND_MAP: Dict[str, str] = {
+    "rust": "cargo test",
+    "python": "pytest",
+    "node": "npm test",
+    "go": "go test ./...",
+    "make": "make test",
+    "java": "mvn test",
+}
+
 
 def _read_config(key: str) -> Optional[str]:
     """Read a config value from the carry_forward DB. Returns None if not set."""
@@ -178,6 +189,21 @@ def detect_project_type(project_dir: str) -> Optional[str]:
             return ptype
 
     return None
+
+
+def detect_test_command(project_dir: str) -> Optional[str]:
+    """Detect the test command for a project directory.
+
+    Uses detect_project_type() to identify the project type, then looks up
+    the corresponding test command in TEST_COMMAND_MAP.
+
+    Returns the test command string (e.g. "cargo test", "pytest"), or None
+    if the project type cannot be determined or has no known test command.
+    """
+    ptype = detect_project_type(project_dir)
+    if not ptype:
+        return None
+    return TEST_COMMAND_MAP.get(ptype)
 
 
 def _read_project_config(project_dir: str, key: str) -> Optional[str]:
@@ -2673,6 +2699,11 @@ def cmd_context(include_cron: bool = False) -> None:
                 if gs.get("dirty"):
                     print(f"    DIRTY: {len(gs.get('dirty_files', []))} uncommitted changes")
 
+                # Phase 8: Show detected test command
+                test_cmd = detect_test_command(gs.get("git_root", d))
+                if test_cmd:
+                    print(f"    TEST: {test_cmd}")
+
             # Read project state files (ROADMAP.md, etc.)
             ps = read_project_state(d)
             if ps.get("files"):
@@ -3069,6 +3100,17 @@ if __name__ == "__main__":
 
     elif cmd == "learn":
         cmd_learn()
+
+    elif cmd == "detect-test-command":
+        if len(sys.argv) < 3:
+            print("Usage: carry_forward.py detect-test-command <project_dir>")
+            sys.exit(1)
+        result = detect_test_command(sys.argv[2])
+        if result:
+            print(result)
+        else:
+            print("No test command detected for this project.")
+            sys.exit(1)
 
     elif cmd == "roadmap":
         sid = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else None

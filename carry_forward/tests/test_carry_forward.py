@@ -1597,3 +1597,159 @@ class TestProjectThresholdsTable:
         conn.close()
         assert len(rows) == 1
         assert rows[0][0] == "7"
+
+
+# ===========================================================================
+# Tests: Phase 8 -- Test command discovery
+# ===========================================================================
+
+class TestDetectTestCommand:
+    """Tests for detect_test_command()."""
+
+    def test_rust_project(self, patched_env, tmp_path):
+        """Cargo.toml -> cargo test."""
+        (tmp_path / "Cargo.toml").write_text('[package]\nname = "t"\n')
+        (tmp_path / ".git").mkdir()
+        result = patched_env.detect_test_command(str(tmp_path))
+        assert result == "cargo test"
+
+    def test_python_project_pyproject(self, patched_env, tmp_path):
+        """pyproject.toml -> pytest."""
+        (tmp_path / "pyproject.toml").write_text("[tool.pytest]\n")
+        (tmp_path / ".git").mkdir()
+        result = patched_env.detect_test_command(str(tmp_path))
+        assert result == "pytest"
+
+    def test_python_project_setup_py(self, patched_env, tmp_path):
+        """setup.py -> pytest."""
+        (tmp_path / "setup.py").write_text("from setuptools import setup\n")
+        (tmp_path / ".git").mkdir()
+        result = patched_env.detect_test_command(str(tmp_path))
+        assert result == "pytest"
+
+    def test_node_project(self, patched_env, tmp_path):
+        """package.json -> npm test."""
+        (tmp_path / "package.json").write_text('{"name": "t"}\n')
+        (tmp_path / ".git").mkdir()
+        result = patched_env.detect_test_command(str(tmp_path))
+        assert result == "npm test"
+
+    def test_go_project(self, patched_env, tmp_path):
+        """go.mod -> go test ./..."""
+        (tmp_path / "go.mod").write_text("module example.com/t\n")
+        (tmp_path / ".git").mkdir()
+        result = patched_env.detect_test_command(str(tmp_path))
+        assert result == "go test ./..."
+
+    def test_make_project(self, patched_env, tmp_path):
+        """Makefile -> make test."""
+        (tmp_path / "Makefile").write_text("test:\n\techo ok\n")
+        (tmp_path / ".git").mkdir()
+        result = patched_env.detect_test_command(str(tmp_path))
+        assert result == "make test"
+
+    def test_java_project_gradle(self, patched_env, tmp_path):
+        """build.gradle -> mvn test."""
+        (tmp_path / "build.gradle").write_text("plugins { id 'java' }\n")
+        (tmp_path / ".git").mkdir()
+        result = patched_env.detect_test_command(str(tmp_path))
+        assert result == "mvn test"
+
+    def test_no_marker_files(self, patched_env, tmp_path):
+        """No marker files -> None."""
+        (tmp_path / ".git").mkdir()
+        result = patched_env.detect_test_command(str(tmp_path))
+        assert result is None
+
+    def test_nonexistent_dir(self, patched_env):
+        """Nonexistent directory -> None."""
+        result = patched_env.detect_test_command("/nonexistent/path/xyz")
+        assert result is None
+
+    def test_subdir_finds_git_root(self, patched_env, tmp_path):
+        """detect_test_command should find test command from a subdirectory."""
+        (tmp_path / "Cargo.toml").write_text('[package]\nname = "t"\n')
+        (tmp_path / ".git").mkdir()
+        subdir = tmp_path / "src" / "bin"
+        subdir.mkdir(parents=True)
+        result = patched_env.detect_test_command(str(subdir))
+        assert result == "cargo test"
+
+    def test_cargo_takes_priority_over_pyproject(self, patched_env, tmp_path):
+        """Cargo.toml is checked before pyproject.toml (marker order matters)."""
+        (tmp_path / "Cargo.toml").write_text('[package]\nname = "t"\n')
+        (tmp_path / "pyproject.toml").write_text("[tool.pytest]\n")
+        (tmp_path / ".git").mkdir()
+        result = patched_env.detect_test_command(str(tmp_path))
+        assert result == "cargo test"
+
+
+class TestTestCommandMap:
+    """Tests for the TEST_COMMAND_MAP constant."""
+
+    def test_all_project_types_have_test_commands(self, patched_env):
+        """Every project type in PROJECT_TYPE_DEFAULTS should have a test command."""
+        for ptype in patched_env.PROJECT_TYPE_DEFAULTS:
+            assert ptype in patched_env.TEST_COMMAND_MAP, f"Missing test command for {ptype}"
+
+    def test_map_values_are_strings(self, patched_env):
+        """All test command values should be non-empty strings."""
+        for ptype, cmd in patched_env.TEST_COMMAND_MAP.items():
+            assert isinstance(cmd, str), f"Test command for {ptype} is not a string"
+            assert len(cmd) > 0, f"Test command for {ptype} is empty"
+
+
+class TestContextIncludesTestCommand:
+    """Tests that cmd_context includes test command in PROJECT STATUS."""
+
+    def test_context_shows_test_command_for_python_project(
+        self, state_db, carry_db, patched_env, tmp_path, capsys
+    ):
+        """Context output should include TEST: line when detect_test_command returns one."""
+        from unittest.mock import patch
+
+        # Insert a session with a file path that the regex will match
+        insert_session(state_db, "ctx_test", msgs=10, tools=5)
+        conn = sqlite3.connect(state_db)
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            ("ctx_test", "user",
+             "Work on /home/jericho/zion/projects/myproject/main.py",
+             time.time())
+        )
+        conn.commit()
+        conn.close()
+
+        # Mock detect_test_command to return "pytest" -- the integration we're
+        # testing is that cmd_context calls it and prints the result.
+        with patch.object(patched_env, "detect_test_command", return_value="pytest"):
+            # Mock git_status to return a valid git root
+            with patch.object(patched_env, "git_status", return_value={
+                "git_root": "/home/jericho/zion/projects/myproject",
+                "branch": "master",
+                "last_commits": ["abc123 init"],
+                "dirty": False,
+                "error": None,
+            }):
+                patched_env.cmd_context()
+
+        output = capsys.readouterr().out
+        assert "TEST: pytest" in output
+
+    def test_context_no_test_command_without_project(
+        self, state_db, carry_db, patched_env, capsys
+    ):
+        """Context with no project dirs should not show TEST: lines."""
+        insert_session(state_db, "no_proj", msgs=10, tools=5)
+        conn = sqlite3.connect(state_db)
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            ("no_proj", "user", "general task no files", time.time())
+        )
+        conn.commit()
+        conn.close()
+
+        patched_env.cmd_context()
+        output = capsys.readouterr().out
+
+        assert "TEST:" not in output

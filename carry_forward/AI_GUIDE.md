@@ -10,12 +10,12 @@ It is NOT: a task manager, an orchestrator, a workflow engine, or a prompt build
 
 ```
 carry_forward/
-├── carry_forward.py         # Core: 2452 lines, all logic
+├── carry_forward.py         # Core: 3100+ lines, all logic
 ├── roadmap_integration.py   # Bridge: reads roadmap.yaml files for progress
 ├── replay_harness.py        # Testing: backtests decisions against history
 ├── tests/
-│   ├── test_carry_forward.py    # 83 unit tests
-│   └── test_replay_harness.py   # 14 replay tests
+│   ├── test_carry_forward.py    # 148 unit tests
+│   └── test_replay_harness.py   # 15 replay tests
 ├── ROADMAP.md                # Phases and priorities
 ├── AI_GUIDE.md               # This file
 └── pyproject.toml            # Python 3.10+, pytest, mypy
@@ -100,6 +100,20 @@ CLI:
 4. Add tests in `tests/test_carry_forward.py`
 5. Test with `replay_harness.py` to verify it doesn't break historical decisions
 
+## Test Command Discovery (Phase 8)
+
+`detect_test_command(project_dir)` uses the same marker-file approach as `detect_project_type()` but returns the test command string instead of the type. Surfaces in `cmd_context` output as `TEST: <command>` under each project's status.
+
+Mapping (`TEST_COMMAND_MAP`):
+- rust -> `cargo test`
+- python -> `pytest`
+- node -> `npm test`
+- go -> `go test ./...`
+- make -> `make test`
+- java -> `mvn test`
+
+CLI: `carry_forward.py detect-test-command <project_dir>`
+
 ## Dependencies
 
 - Core: Python stdlib only (sqlite3, subprocess, re, json, time)
@@ -109,7 +123,7 @@ CLI:
 ## Test Command
 
 ```bash
-python3 -m pytest              # run all 97 tests
+python3 -m pytest              # run all 163 tests
 python3 -m pytest tests/test_carry_forward.py  # just core tests
 python3 replay_harness.py      # backtest against history
 ```
