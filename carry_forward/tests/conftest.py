@@ -194,3 +194,28 @@ def insert_test_count(carry_db, session_id, tick_number, test_count, source="pyt
     )
     conn.commit()
     conn.close()
+
+
+def insert_decision(carry_db, session_id, decision, can_continue, reasons=None):
+    """Insert a decision_log entry and return its ID."""
+    import json
+    conn = sqlite3.connect(carry_db)
+    conn.execute(
+        "INSERT INTO decision_log (session_id, decision, reasons_json, thresholds_json, can_continue, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (session_id, decision, json.dumps(reasons or []), json.dumps({}), 1 if can_continue else 0, time.time())
+    )
+    dec_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.commit()
+    conn.close()
+    return dec_id
+
+
+def insert_outcome(carry_db, decision_id, session_id, productive=1, git_moved=0, chain_continued=0, tool_calls=0, messages=0):
+    """Insert a decision_outcomes entry."""
+    conn = sqlite3.connect(carry_db)
+    conn.execute(
+        "INSERT INTO decision_outcomes (decision_id, session_id, outcome_productive, outcome_git_moved, outcome_chain_continued, outcome_tool_calls, outcome_message_count, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (decision_id, session_id, productive, git_moved, chain_continued, tool_calls, messages, time.time())
+    )
+    conn.commit()
+    conn.close()

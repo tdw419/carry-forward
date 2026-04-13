@@ -12,7 +12,7 @@ import pytest
 
 # Ensure conftest helpers are importable
 sys.path.insert(0, os.path.dirname(__file__))
-from conftest import insert_session, insert_blocker, insert_git_heads, insert_config, insert_chain, insert_tick_changes, insert_test_count  # noqa: E402
+from conftest import insert_session, insert_blocker, insert_git_heads, insert_config, insert_chain, insert_tick_changes, insert_test_count, insert_decision, insert_outcome  # noqa: E402
 
 
 # ===========================================================================
@@ -806,3 +806,209 @@ class TestConsecutiveNoop:
         result = patched_env.check_can_continue("no_s0")
         assert result["noop_halt"] is False
         assert result["consecutive_noops"] == 0
+
+
+# ===========================================================================
+# Tests: Phase 5 -- Outcome tracking & calibration
+# ===========================================================================
+
+class TestAutoRecordOutcomes:
+    """Tests for auto_record_outcomes running automatically in the pipeline."""
+
+    def test_auto_records_on_should_continue(self, state_db, carry_db, patched_env):
+        """auto_record_outcomes should fire during should-continue."""
+        # Create a session that had a decision
+        insert_session(state_db, "prev_auto", msgs=10, tools=5, source='cli')
+
+        # Log a decision for prev_auto
+        result = patched_env.check_can_continue("prev_auto")
+        assert result["decision_id"] is not None
+
+        # auto_record_outcomes finds the last session with msg_count > 5
+        # and calls record_outcome(that_session_id) which looks for a decision
+        # for that session. prev_auto has a decision, so it should record it.
+        # Call should_continue (which calls auto_record_outcomes internally)
+        with pytest.raises(SystemExit):
+            patched_env.cmd_should_continue()
+
+        # Check that an outcome was recorded
+        conn = sqlite3.connect(carry_db)
+        count = conn.execute("SELECT COUNT(*) FROM decision_outcomes").fetchone()[0]
+        conn.close()
+        assert count >= 1
+
+    def test_auto_record_no_crash_on_empty(self, state_db, carry_db, patched_env):
+        """auto_record_outcomes should not crash with no sessions."""
+        patched_env.auto_record_outcomes()  # should silently do nothing
+
+
+class TestConfigHelpers:
+    """Tests for config table reads/writes."""
+
+    def test_get_threshold_default(self, carry_db, patched_env):
+        """get_threshold returns default when no config set."""
+        val = patched_env.get_threshold("noop_limit")
+        assert val == 3  # default NOOP_LIMIT
+
+    def test_get_threshold_from_config(self, carry_db, patched_env):
+        """get_threshold reads from config table when set."""
+        insert_config(carry_db, "noop_limit", "5")
+        val = patched_env.get_threshold("noop_limit")
+        assert val == 5
+
+    def test_get_threshold_unknown_key_raises(self, carry_db, patched_env):
+        """get_threshold raises on unknown key."""
+        with pytest.raises(ValueError, match="Unknown threshold"):
+            patched_env.get_threshold("nonexistent_key")
+
+    def test_get_all_thresholds(self, carry_db, patched_env):
+        """get_all_thresholds returns all defaults."""
+        thresholds = patched_env.get_all_thresholds()
+        assert "noop_limit" in thresholds
+        assert "stagnation_stall_limit" in thresholds
+        assert "blocker_halt_hours" in thresholds
+        assert thresholds["noop_limit"] == 3
+        assert thresholds["blocker_halt_hours"] == 4.0
+
+    def test_write_and_read_config(self, carry_db, patched_env):
+        """_write_config + _read_config round-trip."""
+        patched_env._write_config("test_key", "42", "test")
+        val = patched_env._read_config("test_key")
+        assert val == "42"
+
+    def test_threshold_overrides_decision(self, state_db, carry_db, patched_env):
+        """Setting noop_limit to 2 should cause halt at 2 no-ops instead of 3."""
+        insert_config(carry_db, "git_min_sessions", "2")
+        insert_config(carry_db, "noop_limit", "2")  # override from default 3
+
+        insert_session(state_db, "tn_0", msgs=10, tools=5)
+        insert_session(state_db, "tn_1", parent="tn_0", msgs=10, tools=5)
+        insert_session(state_db, "tn_2", parent="tn_1", msgs=1, tools=0)
+
+        insert_git_heads(carry_db, "tn_0", "/project", "aaa000")
+        insert_git_heads(carry_db, "tn_1", "/project", "aaa000")
+        insert_git_heads(carry_db, "tn_2", "/project", "aaa000")
+
+        result = patched_env.check_can_continue("tn_2")
+        assert result["can_continue"] is False
+        assert result["noop_halt"] is True
+
+
+class TestCalibration:
+    """Tests for calibrate_thresholds logic."""
+
+    def test_calibration_needs_5_outcomes(self, carry_db, patched_env):
+        """Calibration should return early with <5 outcomes."""
+        result = patched_env.calibrate_thresholds()
+        assert result["changes"] == []
+        assert "Not enough" in result["summary"]["message"]
+
+    def test_calibration_good_continue_loosens(self, carry_db, patched_env):
+        """High continue accuracy should loosen stall/noop limits."""
+        # 9 productive continues, 1 unproductive = 90% rate (>80%)
+        for i in range(9):
+            dec_id = insert_decision(carry_db, f"sess_gc_{i}", "continue", True)
+            insert_outcome(carry_db, dec_id, f"sess_gc_{i}", productive=1)
+        dec_id = insert_decision(carry_db, "sess_gf_0", "continue", True)
+        insert_outcome(carry_db, dec_id, "sess_gf_0", productive=0)
+
+        result = patched_env.calibrate_thresholds()
+        # Should have loosened stagnation_stall_limit or noop_limit
+        keys_changed = [c["key"] for c in result["changes"]]
+        assert "stagnation_stall_limit" in keys_changed or "noop_limit" in keys_changed
+
+    def test_calibration_bad_continue_tightens(self, carry_db, patched_env):
+        """Low continue accuracy should tighten limits."""
+        # 2 productive, 8 unproductive = 20% rate (< 50%)
+        for i in range(2):
+            dec_id = insert_decision(carry_db, f"sess_bc_{i}", "continue", True)
+            insert_outcome(carry_db, dec_id, f"sess_bc_{i}", productive=1)
+        for i in range(8):
+            dec_id = insert_decision(carry_db, f"sess_bf_{i}", "continue", True)
+            insert_outcome(carry_db, dec_id, f"sess_bf_{i}", productive=0)
+
+        result = patched_env.calibrate_thresholds()
+        keys_changed = [c["key"] for c in result["changes"]]
+        assert any(k in keys_changed for k in ["stagnation_stall_limit", "noop_limit", "hallucination_loop_limit"])
+
+    def test_calibration_dry_run_no_write(self, carry_db, patched_env):
+        """Dry run should not persist changes."""
+        for i in range(6):
+            dec_id = insert_decision(carry_db, f"sess_dr_{i}", "continue", True)
+            insert_outcome(carry_db, dec_id, f"sess_dr_{i}", productive=1)
+        for i in range(4):
+            dec_id = insert_decision(carry_db, f"sess_drf_{i}", "continue", True)
+            insert_outcome(carry_db, dec_id, f"sess_drf_{i}", productive=0)
+
+        result = patched_env.calibrate_thresholds(dry_run=True)
+        # Should report changes but not write to DB
+        if result["changes"]:
+            # Verify config table was NOT written
+            val = patched_env._read_config(result["changes"][0]["key"])
+            assert val is None  # no config override written
+
+    def test_calibration_clamps_to_min_max(self, carry_db, patched_env):
+        """Calibration should not exceed min/max bounds."""
+        # Set noop_limit to its max (10) already
+        insert_config(carry_db, "noop_limit", "10")
+
+        # Create high-accuracy data to trigger loosening (9/10 = 90% > 80%)
+        for i in range(9):
+            dec_id = insert_decision(carry_db, f"sess_cl_{i}", "continue", True)
+            insert_outcome(carry_db, dec_id, f"sess_cl_{i}", productive=1)
+        dec_id = insert_decision(carry_db, "sess_cl_9", "continue", True)
+        insert_outcome(carry_db, dec_id, "sess_cl_9", productive=0)
+
+        result = patched_env.calibrate_thresholds()
+        # noop_limit was already at max (10), so it shouldn't appear in changes
+        # or should stay at 10
+        for c in result["changes"]:
+            if c["key"] == "noop_limit":
+                assert c["new"] <= 10  # max bound
+
+    def test_calibration_good_halt_tightens_dead(self, carry_db, patched_env):
+        """High halt accuracy should tighten dead_session_threshold."""
+        # 3 accurate halts (unproductive sessions correctly halted)
+        for i in range(3):
+            dec_id = insert_decision(carry_db, f"sess_gh_{i}", "halt", False)
+            insert_outcome(carry_db, dec_id, f"sess_gh_{i}", productive=0)
+
+        # 7 productive continues
+        for i in range(7):
+            dec_id = insert_decision(carry_db, f"sess_gpc_{i}", "continue", True)
+            insert_outcome(carry_db, dec_id, f"sess_gpc_{i}", productive=1)
+
+        result = patched_env.calibrate_thresholds()
+        keys_changed = [c["key"] for c in result["changes"]]
+        assert "dead_session_threshold" in keys_changed
+
+    def test_cmd_calibrate_runs(self, carry_db, patched_env, capsys):
+        """cmd_calibrate should print output without crashing."""
+        patched_env.cmd_calibrate()
+        output = capsys.readouterr().out
+        assert "Outcome count" in output
+
+    def test_cmd_calibrate_dry_run(self, carry_db, patched_env, capsys):
+        """cmd_calibrate --dry-run should work."""
+        patched_env.cmd_calibrate(dry_run=True)
+        output = capsys.readouterr().out
+        assert "Outcome count" in output
+
+
+class TestCmdShowConfig:
+    """Tests for show-config command."""
+
+    def test_show_config_defaults(self, carry_db, patched_env, capsys):
+        """show-config should show all defaults."""
+        patched_env.cmd_show_config()
+        output = capsys.readouterr().out
+        assert "noop_limit = 3" in output
+        assert "source: default" in output
+
+    def test_show_config_with_override(self, carry_db, patched_env, capsys):
+        """show-config should show calibrated values."""
+        insert_config(carry_db, "noop_limit", "5", source="calibration")
+        patched_env.cmd_show_config()
+        output = capsys.readouterr().out
+        assert "noop_limit = 5" in output
+        assert "source: calibration" in output

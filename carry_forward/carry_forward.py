@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Carry Forward v5 - self-tuning intelligence layer for Hermes session continuity.
+Carry Forward v5.3 - self-tuning intelligence layer for Hermes session continuity.
 Transport, not comprehension. Packages what happened; agents do the interpretation.
 v5: Decisions are logged, outcomes are tracked, thresholds are calibrated from data.
 
@@ -45,7 +45,7 @@ CARRY_DB_PATH = os.path.expanduser("~/.hermes/carry_forward.db")
 # DB helpers
 # ---------------------------------------------------------------------------
 
-# Decision thresholds (simple constants -- no calibration)
+# Decision thresholds (defaults -- can be overridden via config table)
 DEAD_SESSION_THRESHOLD = 3
 DEAD_LOOKBACK = 5
 ORPHAN_CHILD_THRESHOLD = 10
@@ -55,6 +55,65 @@ STAGNATION_STALL_LIMIT = 3  # consecutive no-commit ticks before hard halt
 HALLUCINATION_LOOP_LIMIT = 3  # same files in N consecutive ticks = hallucination loop
 TEST_REGRESSION_THRESHOLD = 2  # drop of N+ tests in single tick = regression halt
 NOOP_LIMIT = 3  # consecutive no-op ticks before hard halt
+
+# ---------------------------------------------------------------------------
+# Config helpers -- read/write tunable thresholds from DB
+# ---------------------------------------------------------------------------
+
+# Mapping of threshold constants to their config keys and types
+THRESHOLD_DEFS = {
+    "dead_session_threshold": {"default": DEAD_SESSION_THRESHOLD, "type": int, "min": 1, "max": 10},
+    "dead_lookback": {"default": DEAD_LOOKBACK, "type": int, "min": 3, "max": 20},
+    "orphan_child_threshold": {"default": ORPHAN_CHILD_THRESHOLD, "type": int, "min": 3, "max": 30},
+    "blocker_halt_hours": {"default": BLOCKER_HALT_HOURS, "type": float, "min": 1.0, "max": 24.0},
+    "git_min_sessions": {"default": GIT_MIN_SESSIONS, "type": int, "min": 2, "max": 10},
+    "stagnation_stall_limit": {"default": STAGNATION_STALL_LIMIT, "type": int, "min": 2, "max": 10},
+    "hallucination_loop_limit": {"default": HALLUCINATION_LOOP_LIMIT, "type": int, "min": 2, "max": 10},
+    "test_regression_threshold": {"default": TEST_REGRESSION_THRESHOLD, "type": int, "min": 1, "max": 20},
+    "noop_limit": {"default": NOOP_LIMIT, "type": int, "min": 2, "max": 10},
+}
+
+
+def _read_config(key: str) -> Optional[str]:
+    """Read a config value from the carry_forward DB. Returns None if not set."""
+    conn = get_carry_conn()
+    row = conn.execute("SELECT value FROM config WHERE key = ?", (key,)).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def _write_config(key: str, value: str, source: str = "calibration") -> None:
+    """Write a config value to the carry_forward DB."""
+    conn = get_carry_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO config (key, value, source, updated_at) VALUES (?, ?, ?, ?)",
+        (key, value, source, time.time())
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_threshold(key: str) -> Any:
+    """Get a threshold value. Checks config table first, falls back to constant."""
+    if key not in THRESHOLD_DEFS:
+        raise ValueError(f"Unknown threshold: {key}")
+    defn = THRESHOLD_DEFS[key]
+    val_str = _read_config(key)
+    if val_str is not None:
+        return defn["type"](val_str)
+    return defn["default"]
+
+
+def get_all_thresholds() -> Dict[str, Any]:
+    """Return all threshold values (from config or defaults)."""
+    result = {}
+    for key, defn in THRESHOLD_DEFS.items():
+        val_str = _read_config(key)
+        if val_str is not None:
+            result[key] = defn["type"](val_str)
+        else:
+            result[key] = defn["default"]
+    return result
 
 
 def _get_chain_stalls(session_id: str) -> int:
@@ -297,7 +356,7 @@ def _detect_test_regression(session_id: str) -> Tuple[bool, int, int, str]:
     prev_count, prev_source = rows[1]
     delta = prev_count - curr_count  # positive means tests were removed
 
-    if delta > TEST_REGRESSION_THRESHOLD:
+    if delta > get_threshold("test_regression_threshold"):
         return True, prev_count, curr_count, (
             f"test count dropped by {delta} ({prev_count} -> {curr_count}) "
             f"in single tick [{curr_source}]"
@@ -508,6 +567,14 @@ def get_carry_conn() -> sqlite3.Connection:
         )
     """)
     # v5: Tunable config -- thresholds read from here instead of hardcoded
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'default',
+            updated_at REAL NOT NULL
+        )
+    """)
     conn.commit()
     return conn
 
@@ -685,7 +752,7 @@ def check_git_progress(session_id: str, min_sessions: Optional[int] = None) -> T
     Returns (progress_made, details_str).
     This catches 'busy but unproductive' -- sessions that log work but never commit."""
     if min_sessions is None:
-        min_sessions = GIT_MIN_SESSIONS
+        min_sessions = get_threshold("git_min_sessions")
     # Walk the chain to find the oldest session with recorded git heads
     conn = get_conn()
     cur = conn.cursor()
@@ -764,9 +831,9 @@ def detect_thrash(session_id: Optional[str] = None, lookback: Optional[int] = No
         details: Human-readable summary string.
     """
     if lookback is None:
-        lookback = DEAD_LOOKBACK
-    dead_thresh = DEAD_SESSION_THRESHOLD
-    orphan_thresh = ORPHAN_CHILD_THRESHOLD
+        lookback = get_threshold("dead_lookback")
+    dead_thresh = get_threshold("dead_session_threshold")
+    orphan_thresh = get_threshold("orphan_child_threshold")
     conn = get_conn()
     cur = conn.cursor()
 
@@ -934,7 +1001,7 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
     stale_blockers = carry_conn.execute("""
         SELECT message, created_at FROM blockers
         WHERE resolved_at IS NULL AND created_at < ?
-    """, (now - (BLOCKER_HALT_HOURS * 3600),)).fetchall()
+    """, (now - (get_threshold("blocker_halt_hours") * 3600),)).fetchall()
     carry_conn.close()
 
     if stale_blockers:
@@ -979,12 +1046,12 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
     # Active session override: if this session has tool calls, don't halt (might be mid-commit).
     stagnation_halt = False
     consecutive_stalls = _get_chain_stalls(resolved_session_id or "")
-    if git_stalled and consecutive_stalls >= STAGNATION_STALL_LIMIT and own_tools == 0:
+    if git_stalled and consecutive_stalls >= get_threshold("stagnation_stall_limit") and own_tools == 0:
         stagnation_halt = True
         reasons.append(
             f"Stagnation: {consecutive_stalls} consecutive ticks with no commits"
         )
-    elif git_stalled and consecutive_stalls >= STAGNATION_STALL_LIMIT:
+    elif git_stalled and consecutive_stalls >= get_threshold("stagnation_stall_limit"):
         guard_rails.append(
             f"Stagnation detected ({consecutive_stalls} stalls) but session is active"
         )
@@ -1002,7 +1069,7 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
             hallucination_halt = True
             hallucination_files = h_files
             reasons.append(
-                f"Hallucination loop: same {len(h_files)} file(s) in {HALLUCINATION_LOOP_LIMIT}+ ticks "
+                f"Hallucination loop: same {len(h_files)} file(s) in {get_threshold('hallucination_loop_limit')}+ ticks "
                 f"with no commit ({', '.join(h_files[:3])})"
             )
         elif h_loop:
@@ -1031,17 +1098,18 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
 
     # Check 10: Consecutive no-op counter (v7)
     # Unified metric: no commit AND no test increase = no-op.
-    # Hard halt after NOOP_LIMIT consecutive no-ops with no active tools.
+    # Hard halt after noop_limit consecutive no-ops with no active tools.
     noop_halt = False
+    noop_limit = get_threshold("noop_limit")
     consecutive_noops = _count_consecutive_noops(resolved_session_id or "")
     is_noop = (git_stalled and not test_regression_halt)  # no commit and no test crash
     _update_noop_counter(resolved_session_id or "", is_noop)
-    if consecutive_noops >= NOOP_LIMIT and own_tools == 0:
+    if consecutive_noops >= noop_limit and own_tools == 0:
         noop_halt = True
         reasons.append(
             f"No-op loop: {consecutive_noops} consecutive ticks with no commit or test increase"
         )
-    elif consecutive_noops >= NOOP_LIMIT:
+    elif consecutive_noops >= noop_limit:
         guard_rails.append(
             f"No-op loop detected ({consecutive_noops} no-ops) but session is active"
         )
@@ -1136,6 +1204,9 @@ def cmd_should_continue(session_id: Optional[str] = None) -> None:
     0 = safe to chain, 1 = thrashing / blockers / should stop.
     Also prints human-readable reasoning.
     """
+    # Auto-record outcome from previous session before making a decision
+    auto_record_outcomes()
+
     result = check_can_continue(session_id)
 
     if not result["can_continue"]:
@@ -1339,6 +1410,175 @@ def auto_record_outcomes() -> None:
     conn.close()
     if last:
         record_outcome(last[0])
+
+    # Auto-calibrate every 10 outcomes
+    try:
+        carry_conn = get_carry_conn()
+        count = carry_conn.execute("SELECT COUNT(*) FROM decision_outcomes").fetchone()[0]
+        carry_conn.close()
+        if count > 0 and count % 10 == 0:
+            # Check if we already calibrated at this count
+            carry_conn2 = get_carry_conn()
+            last_cal = carry_conn2.execute(
+                "SELECT value FROM config WHERE key = 'last_calibration_outcome_count'"
+            ).fetchone()
+            last_cal_count = int(last_cal[0]) if last_cal else 0
+            carry_conn2.close()
+            if count != last_cal_count:
+                calibrate_thresholds()
+                carry_conn3 = get_carry_conn()
+                carry_conn3.execute(
+                    "INSERT OR REPLACE INTO config (key, value, source, updated_at) VALUES (?, ?, ?, ?)",
+                    ("last_calibration_outcome_count", str(count), "auto", time.time())
+                )
+                carry_conn3.commit()
+                carry_conn3.close()
+    except Exception:
+        pass  # calibration is best-effort
+
+
+# ---------------------------------------------------------------------------
+# v5: Calibration
+# ---------------------------------------------------------------------------
+
+
+def calibrate_thresholds(dry_run: bool = False) -> Dict[str, Any]:
+    """Analyze decision outcomes and adjust thresholds.
+
+    Calibration rules:
+    - If continue decisions are mostly productive (>80%), loosen stall/noop limits by 1.
+    - If continue decisions are mostly unproductive (<50%), tighten stall/noop limits by 1.
+    - If halt decisions correctly caught bad sessions (>80% unproductive), tighten by 1.
+    - If halt decisions were wrong (>50% were actually productive), loosen by 1.
+    - Clamped to min/max bounds from THRESHOLD_DEFS.
+
+    Returns:
+        Dict with 'changes' list and 'summary' stats.
+    """
+    conn = get_carry_conn()
+
+    # Gather outcomes
+    rows = conn.execute("""
+        SELECT dl.decision, dl.can_continue,
+               do_out.outcome_productive, do_out.outcome_git_moved,
+               do_out.outcome_chain_continued, do_out.outcome_tool_calls
+        FROM decision_outcomes do_out
+        JOIN decision_log dl ON do_out.decision_id = dl.id
+        ORDER BY do_out.checked_at DESC
+        LIMIT 100
+    """).fetchall()
+    conn.close()
+
+    if len(rows) < 5:
+        return {"changes": [], "summary": {"message": "Not enough outcomes to calibrate (need 5+)", "outcome_count": len(rows)}}
+
+    # Analyze by decision type
+    continue_outcomes = [(r[2], r[3], r[4], r[5]) for r in rows if r[1] == 1]  # can_continue=1
+    halt_outcomes = [(r[2], r[3], r[4], r[5]) for r in rows if r[1] == 0]     # can_continue=0
+
+    # "correct" means: continue -> productive OR halt -> unproductive
+    continue_productive = sum(1 for o in continue_outcomes if o[0])  # productive
+    continue_count = len(continue_outcomes)
+    halt_unproductive = sum(1 for o in halt_outcomes if not o[0])  # unproductive
+    halt_count = len(halt_outcomes)
+
+    changes = []
+
+    def _adjust(key: str, delta: int, reason: str) -> None:
+        current = get_threshold(key)
+        defn = THRESHOLD_DEFS[key]
+        new_val = current + delta
+        new_val = max(defn["min"], min(defn["max"], new_val))
+        if new_val != current:
+            if not dry_run:
+                _write_config(key, str(new_val), "calibration")
+            changes.append({
+                "key": key,
+                "old": current,
+                "new": new_val,
+                "reason": reason,
+            })
+
+    # Continue decision accuracy
+    if continue_count >= 3:
+        productive_rate = continue_productive / continue_count
+        if productive_rate > 0.8:
+            # Good continue rate -> can afford to be more lenient
+            _adjust("stagnation_stall_limit", 1,
+                    f"continue accuracy {productive_rate:.0%} (>{0.8:.0%}), loosening")
+            _adjust("noop_limit", 1,
+                    f"continue accuracy {productive_rate:.0%} (>{0.8:.0%}), loosening")
+        elif productive_rate < 0.5:
+            # Bad continue rate -> tighten up
+            _adjust("stagnation_stall_limit", -1,
+                    f"continue accuracy {productive_rate:.0%} (<{0.5:.0%}), tightening")
+            _adjust("noop_limit", -1,
+                    f"continue accuracy {productive_rate:.0%} (<{0.5:.0%}), tightening")
+            _adjust("hallucination_loop_limit", -1,
+                    f"continue accuracy {productive_rate:.0%} (<{0.5:.0%}), tightening")
+
+    # Halt decision accuracy
+    if halt_count >= 3:
+        halt_correct_rate = halt_unproductive / halt_count
+        if halt_correct_rate > 0.8:
+            # Halts are accurate -> can tighten more aggressively
+            _adjust("dead_session_threshold", -1,
+                    f"halt accuracy {halt_correct_rate:.0%} (>{0.8:.0%}), tightening dead detection")
+        elif halt_correct_rate < 0.5:
+            # Halts are too aggressive -> loosen
+            _adjust("stagnation_stall_limit", 1,
+                    f"halt accuracy {halt_correct_rate:.0%} (<{0.5:.0%}), loosening")
+            _adjust("noop_limit", 1,
+                    f"halt accuracy {halt_correct_rate:.0%} (<{0.5:.0%}), loosening")
+
+    return {
+        "changes": changes,
+        "summary": {
+            "outcome_count": len(rows),
+            "continue_count": continue_count,
+            "continue_productive_rate": f"{continue_productive / continue_count:.0%}" if continue_count else "N/A",
+            "halt_count": halt_count,
+            "halt_correct_rate": f"{halt_unproductive / halt_count:.0%}" if halt_count else "N/A",
+        }
+    }
+
+
+def cmd_calibrate(dry_run: bool = False) -> None:
+    """Run calibration and print results."""
+    result = calibrate_thresholds(dry_run=dry_run)
+
+    summary = result["summary"]
+    print(f"Outcome count: {summary.get('outcome_count', 0)}")
+    if "message" in summary:
+        print(summary["message"])
+        return
+
+    print(f"Continue decisions: {summary['continue_count']} (productive: {summary['continue_productive_rate']})")
+    print(f"Halt decisions: {summary['halt_count']} (correct: {summary['halt_correct_rate']})")
+
+    if result["changes"]:
+        print(f"\nThreshold changes ({'dry run' if dry_run else 'applied'}):")
+        for c in result["changes"]:
+            print(f"  {c['key']}: {c['old']} -> {c['new']} ({c['reason']})")
+    else:
+        print("\nNo threshold changes needed.")
+
+
+def cmd_show_config() -> None:
+    """Show all current threshold values and their source."""
+    print("=== Carry Forward Thresholds ===\n")
+    for key, defn in THRESHOLD_DEFS.items():
+        val_str = _read_config(key)
+        if val_str is not None:
+            source_row = None
+            conn = get_carry_conn()
+            row = conn.execute("SELECT source, updated_at FROM config WHERE key = ?", (key,)).fetchone()
+            conn.close()
+            source = row[0] if row else "unknown"
+            ts = datetime.fromtimestamp(row[1]).strftime("%Y-%m-%d %H:%M") if row and row[1] else "?"
+            print(f"  {key} = {val_str}  (source: {source}, since {ts})")
+        else:
+            print(f"  {key} = {defn['default']}  (source: default)")
 
 
 # ---------------------------------------------------------------------------
@@ -2196,6 +2436,13 @@ if __name__ == "__main__":
         sid = sys.argv[2] if len(sys.argv) > 2 else None
         result = record_outcome(sid)
         print(json.dumps(result, indent=2))
+
+    elif cmd == "calibrate":
+        dry_run = "--dry-run" in sys.argv
+        cmd_calibrate(dry_run)
+
+    elif cmd == "show-config":
+        cmd_show_config()
 
     elif cmd == "roadmap":
         sid = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else None

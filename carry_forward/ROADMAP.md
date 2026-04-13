@@ -2,7 +2,7 @@
 
 **Purpose:** Carry Forward is the decision engine that keeps Hermes autonomous loops productive. It answers one question: "should we spawn another session?" It's not an orchestrator, not a task manager -- it's a governor.
 
-**Current state:** v5.2.0, 2205 lines, 79 tests, 4 guard rail phases built. Powering the generic `chain` script across multiple projects.
+**Current state:** v5.3.0, 2452 lines, 97 tests, 5 guard rail phases built. Powering the generic `chain` script across multiple projects.
 
 ## What Works
 
@@ -10,6 +10,7 @@
 - Hallucination loop detection (Phase 2)
 - Test count regression detection (Phase 3)
 - Consecutive no-op counter (Phase 4)
+- Outcome tracking with auto-calibration (Phase 5)
 - Roadmap integration (scan project roadmaps, completion signals)
 - Context extraction from session DB
 - `check-can-continue` 5-stage decision pipeline
@@ -21,7 +22,7 @@ The engine is solid for "should we continue?" but weak on "what should we do nex
 
 ## Priority Order for Automated Development
 
-- [ ] Phase 5: Outcome tracking -- auto_record_outcomes runs after every chain cycle, records whether the next session was productive (committed code, tests passed). Feed this back into threshold calibration. Currently record_outcome exists but is never called automatically.
+- [x] Phase 5: Outcome tracking -- auto_record_outcomes runs after every chain cycle, records whether the next session was productive (committed code, tests passed). Feed this back into threshold calibration. Currently record_outcome exists but is never called automatically.
 - [ ] Phase 6: Smarter context -- context command includes top 3 lessons from outcome history (e.g. "this project fails on phases involving vm.rs changes -- use smaller steps"). Currently context is purely factual, no learned intelligence.
 - [ ] Phase 7: Project-aware thresholds -- different projects need different stall/noop thresholds. A Rust project with cargo test takes longer per cycle than a Python project. Calibrate per-project from outcome data.
 - [ ] Phase 8: Test command discovery -- detect project test commands (cargo test, npm test, pytest, make test) and surface them in context so the agent doesn't have to guess. The `chain` script already does this; carry_forward should too.
