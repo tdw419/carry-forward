@@ -1,0 +1,460 @@
+title: "Carry Forward v7"
+version: "7.0.0"
+description: "Simplification pass based on overengineering audit. 5/7 signals flagged, 3 severe. Target: reduce abstraction depth, eliminate parallel implementations, consolidate duplicated query patterns. 223 tests must stay green throughout."
+
+phases:
+  - id: "phase-1"
+    title: "Consolidate duplicated query patterns"
+    status: "planned"
+    goal: "Merge the 4 get_top_* functions and 3 _update_*_counter functions into parameterized helpers"
+    description: |
+      The audit found 3 families of duplicated query/update patterns:
+      
+      1. get_top_lessons, get_top_technical_patterns, get_top_failure_fingerprints all do
+         "SELECT from table, ORDER BY, LIMIT N". 80-100% call overlap. Should be one
+         generic get_top_knowledge(type, n) function.
+      
+      2. _update_stall_counter, _update_noop_counter, store_technical_patterns all do
+         "upsert into table with session_id + metadata". 100% call overlap. Should be one
+         generic _update_counter(table, session_id, data) function.
+      
+      3. _get_chain_stalls and _count_consecutive_noops share 92% of called functions.
+         Both scan session history counting consecutive events. Should be one
+         _count_consecutive_events(session_id, condition_fn) function.
+      
+      Estimated savings: ~80 lines, reduces duplication from 8 findings to ~2.
+    deliverables:
+      - name: "Generic knowledge query function"
+        description: "Replace get_top_lessons, get_top_technical_patterns, get_top_failure_fingerprints with get_top_knowledge(table, n, project_dir=None)"
+        status: "todo"
+        acceptance_criteria:
+          - description: "All 223 existing tests pass"
+            validation: "pytest tests/ -q"
+            met: false
+          - description: "get_top_lessons, get_top_technical_patterns, get_top_failure_fingerprints still work identically"
+            validation: "grep -c calls to new helper == 3"
+            met: false
+          - description: "No change to CLI output"
+            validation: "diff before/after of cmd_learn, cmd_analyze_patterns, cmd_analyze_failures output"
+            met: false
+        tasks:
+          - id: "p1.d1.t1"
+            title: "Create get_top_knowledge(table, n, project_dir, order_by) helper"
+            status: "todo"
+            description: "Generic function that queries any knowledge table with same SELECT/ORDER BY/LIMIT pattern. Returns list of dicts."
+            files: ["carry_forward.py"]
+          - id: "p1.d1.t2"
+            title: "Refactor get_top_lessons to call get_top_knowledge"
+            status: "todo"
+            description: "Thin wrapper that calls get_top_knowledge('lessons', n)"
+            dependencies: ["p1.d1.t1"]
+            files: ["carry_forward.py"]
+          - id: "p1.d1.t3"
+            title: "Refactor get_top_technical_patterns to call get_top_knowledge"
+            status: "todo"
+            description: "Thin wrapper that calls get_top_knowledge('technical_patterns', n, project_dir)"
+            dependencies: ["p1.d1.t1"]
+            files: ["carry_forward.py"]
+          - id: "p1.d1.t4"
+            title: "Refactor get_top_failure_fingerprints to call get_top_knowledge"
+            status: "todo"
+            description: "Thin wrapper that calls get_top_knowledge('failure_fingerprints', n, project_dir)"
+            dependencies: ["p1.d1.t1"]
+            files: ["carry_forward.py"]
+          - id: "p1.d1.t5"
+            title: "Run full test suite and fix any regressions"
+            status: "todo"
+            description: "pytest tests/ -q -- all 223 must pass"
+            dependencies: ["p1.d1.t2", "p1.d1.t3", "p1.d1.t4"]
+            files: ["tests/test_carry_forward.py"]
+
+      - name: "Generic counter update function"
+        description: "Replace _update_stall_counter, _update_noop_counter with _update_event_counter(table, session_id, active, metadata)"
+        status: "todo"
+        acceptance_criteria:
+          - description: "All tests pass"
+            validation: "pytest tests/ -q"
+            met: false
+        tasks:
+          - id: "p1.d2.t1"
+            title: "Create _update_event_counter helper"
+            status: "todo"
+            description: "Generic upsert for event counters. Takes table name, session_id, active flag."
+            files: ["carry_forward.py"]
+          - id: "p1.d2.t2"
+            title: "Refactor _update_stall_counter and _update_noop_counter"
+            status: "todo"
+            description: "Replace bodies with calls to _update_event_counter"
+            dependencies: ["p1.d2.t1"]
+            files: ["carry_forward.py"]
+          - id: "p1.d2.t3"
+            title: "Run full test suite"
+            status: "todo"
+            description: "All 223 tests must pass"
+            dependencies: ["p1.d2.t2"]
+            files: []
+
+      - name: "Merge consecutive event counters"
+        description: "Replace _get_chain_stalls and _count_consecutive_noops with _count_consecutive(session_id, check_fn)"
+        status: "todo"
+        acceptance_criteria:
+          - description: "All tests pass"
+            validation: "pytest tests/ -q"
+            met: false
+        tasks:
+          - id: "p1.d3.t1"
+            title: "Create _count_consecutive helper"
+            status: "todo"
+            description: "Generic consecutive-event counter. Takes session_id and a callable that returns True for events to count."
+            files: ["carry_forward.py"]
+          - id: "p1.d3.t2"
+            title: "Refactor _get_chain_stalls and _count_consecutive_noops"
+            status: "todo"
+            description: "Replace with calls to _count_consecutive with appropriate check functions"
+            dependencies: ["p1.d3.t1"]
+            files: ["carry_forward.py"]
+          - id: "p1.d3.t3"
+            title: "Run full test suite"
+            status: "todo"
+            description: "All 223 tests must pass"
+            dependencies: ["p1.d3.t2"]
+            files: []
+    scope_lines_total: 3420
+    test_target: 223
+    technical_notes: |
+      These are purely structural refactorings. No behavior changes. Each function
+      family has identical call patterns -- just different table names and column names.
+      The parameterized versions should accept the varying parts as arguments.
+    risks:
+      - "Tests may depend on specific function names in mocks/patches -- check conftest.py"
+      - "store_technical_patterns has different shape (takes patterns list, not just session_id) -- may not fit generic counter"
+
+  - id: "phase-2"
+    title: "Eliminate parallel implementations"
+    status: "planned"
+    goal: "Merge cmd_context/get_context_data (129 waste lines) and cmd_last/get_last_assistant_messages"
+    description: |
+      Two pairs of functions doing the same work:
+      
+      1. cmd_context (239 lines) and get_context_data (129 lines) -- 63% call overlap.
+         cmd_context is the CLI version (prints to stdout), get_context_data is the JSON
+         API version (returns dict). cmd_context should call get_context_data and format
+         the result, not re-implement the logic.
+      
+      2. cmd_last (17 lines) and get_last_assistant_messages (27 lines) -- same pattern.
+         cmd_last should call get_last_assistant_messages and format output.
+      
+      Estimated savings: ~146 lines.
+    deliverables:
+      - name: "cmd_context delegates to get_context_data"
+        description: "Rewrite cmd_context to call get_context_data() and format the returned dict as terminal output. Remove all duplicated logic."
+        status: "todo"
+        acceptance_criteria:
+          - description: "cmd_context output is identical to before"
+            validation: "Run both versions, diff output"
+            met: false
+          - description: "get_context_data JSON is identical to before"
+            validation: "Run both versions, diff JSON"
+            met: false
+          - description: "All 223 tests pass"
+            validation: "pytest tests/ -q"
+            met: false
+        tasks:
+          - id: "p2.d1.t1"
+            title: "Audit what cmd_context does that get_context_data doesn't"
+            status: "todo"
+            description: "Compare both functions line by line. Document any logic only in cmd_context."
+            files: ["carry_forward.py"]
+          - id: "p2.d1.t2"
+            title: "Ensure get_context_data covers all cmd_context logic"
+            status: "todo"
+            description: "If cmd_context has extra logic (formatting, display), move the data-gathering into get_context_data and keep only formatting in cmd_context."
+            dependencies: ["p2.d1.t1"]
+            files: ["carry_forward.py"]
+          - id: "p2.d1.t3"
+            title: "Rewrite cmd_context as thin formatter over get_context_data"
+            status: "todo"
+            description: "cmd_context calls get_context_data, then formats the dict for terminal output. No duplicated queries or DB access."
+            dependencies: ["p2.d1.t2"]
+            files: ["carry_forward.py"]
+          - id: "p2.d1.t4"
+            title: "Run full test suite"
+            status: "todo"
+            description: "All 223 tests must pass"
+            dependencies: ["p2.d1.t3"]
+            files: []
+
+      - name: "cmd_last delegates to get_last_assistant_messages"
+        description: "Rewrite cmd_last to call get_last_assistant_messages() and format output."
+        status: "todo"
+        acceptance_criteria:
+          - description: "cmd_last output unchanged"
+            validation: "Run both versions, diff output"
+            met: false
+          - description: "All tests pass"
+            validation: "pytest tests/ -q"
+            met: false
+        tasks:
+          - id: "p2.d2.t1"
+            title: "Rewrite cmd_last to call get_last_assistant_messages"
+            status: "todo"
+            description: "cmd_last becomes: messages = get_last_assistant_messages(depth); for m in messages: print(m)"
+            dependencies: []
+            files: ["carry_forward.py"]
+          - id: "p2.d2.t2"
+            title: "Run full test suite"
+            status: "todo"
+            description: "All 223 tests must pass"
+            dependencies: ["p2.d2.t1"]
+            files: []
+    dependencies:
+      - source: "phase-1"
+        target: "phase-2"
+        type: "soft"
+        reason: "Independent but good to do consolidation first to reduce merge conflicts"
+    scope_lines_total: 3270
+    test_target: 223
+    technical_notes: |
+      cmd_context at line 3276 and get_context_data at line 3862. The 63% overlap means
+      37% is different -- likely formatting vs data gathering. The key is making
+      get_context_data the single source of truth for ALL data, and cmd_context just
+      a presentation layer.
+    risks:
+      - "cmd_context has 239 lines of formatting logic -- some of it may be intertwined with data gathering"
+      - "Tests may assert on specific print output format -- check before refactoring"
+
+  - id: "phase-3"
+    title: "Reduce abstraction depth"
+    status: "planned"
+    goal: "Flatten the call chains in cmd_run (8 layers), cmd_should_continue (7), cmd_context (7)"
+    description: |
+      The dominant signal: 15 abstraction_depth findings, 3 severe. The core decision
+      pipeline goes through too many layers:
+      
+      cmd_run (8 layers)
+        -> cmd_should_continue
+          -> check_can_continue
+            -> detect_thrash
+              -> _get_chain_stalls
+                -> get_conn()
+                  -> SQL query
+      
+      Each layer should have a one-sentence justification. Most don't. The fix is to
+      flatten: combine thin wrappers, inline trivial delegation, and group related
+      checks into fewer functions with more explicit flow.
+      
+      Target: no function with more than 4 layers of call depth.
+    deliverables:
+      - name: "Flatten check_can_continue pipeline"
+        description: "Reduce check_can_continue from 6 layers to 3-4 by merging thin wrappers"
+        status: "todo"
+        acceptance_criteria:
+          - description: "No function has >5 layers of call depth"
+            validation: "Re-run overengineered.py and verify 0 severe abstraction_depth findings"
+            met: false
+          - description: "All 223 tests pass"
+            validation: "pytest tests/ -q"
+            met: false
+          - description: "check_can_continue returns same structure"
+            validation: "Compare JSON output before/after"
+            met: false
+        tasks:
+          - id: "p3.d1.t1"
+            title: "Map the full call chain for check_can_continue"
+            status: "todo"
+            description: "Trace every function call from check_can_continue down to leaf functions. Identify which layers are trivial wrappers (< 5 lines of actual logic)."
+            files: ["carry_forward.py"]
+          - id: "p3.d1.t2"
+            title: "Inline or merge thin wrapper layers"
+            status: "todo"
+            description: "For each trivial wrapper in the chain: either inline it at the call site or merge it with its caller. Keep functions that do real work."
+            dependencies: ["p3.d1.t1"]
+            files: ["carry_forward.py"]
+          - id: "p3.d1.t3"
+            title: "Verify call depth reduced"
+            status: "todo"
+            description: "Re-run overengineered.py or manually verify no function in the check_can_continue chain has >5 depth."
+            dependencies: ["p3.d1.t2"]
+            files: []
+          - id: "p3.d1.t4"
+            title: "Run full test suite"
+            status: "todo"
+            description: "All 223 tests must pass"
+            dependencies: ["p3.d1.t3"]
+            files: []
+
+      - name: "Flatten cmd_run and cmd_should_continue"
+        description: "Reduce cmd_run from 8 layers and cmd_should_continue from 7"
+        status: "todo"
+        acceptance_criteria:
+          - description: "cmd_run has <=5 call depth"
+            validation: "Re-run overengineered.py"
+            met: false
+          - description: "cmd_should_continue has <=5 call depth"
+            validation: "Re-run overengineered.py"
+            met: false
+          - description: "All tests pass"
+            validation: "pytest tests/ -q"
+            met: false
+        tasks:
+          - id: "p3.d2.t1"
+            title: "Map call chains for cmd_run and cmd_should_continue"
+            status: "todo"
+            description: "Trace full call chains. These likely go through check_can_continue which was already flattened."
+            dependencies: ["p3.d1.t4"]
+            files: ["carry_forward.py"]
+          - id: "p3.d2.t2"
+            title: "Flatten remaining deep chains"
+            status: "todo"
+            description: "Apply same thin-wrapper elimination. cmd_run likely just calls cmd_should_continue + some extra -- verify the extra layers are necessary."
+            dependencies: ["p3.d2.t1"]
+            files: ["carry_forward.py"]
+          - id: "p3.d2.t3"
+            title: "Run full test suite"
+            status: "todo"
+            description: "All 223 tests must pass"
+            dependencies: ["p3.d2.t2"]
+            files: []
+
+      - name: "Flatten remaining deep functions"
+        description: "Fix calibrate_thresholds (5), auto_record_outcomes (6), calibrate_project_thresholds (6), get_context_data (6)"
+        status: "todo"
+        acceptance_criteria:
+          - description: "0 functions with >5 call depth"
+            validation: "Re-run overengineered.py -- 0 severe abstraction_depth findings"
+            met: false
+          - description: "All tests pass"
+            validation: "pytest tests/ -q"
+            met: false
+        tasks:
+          - id: "p3.d3.t1"
+            title: "Flatten calibration chain"
+            status: "todo"
+            description: "calibrate_thresholds -> calibrate_project_thresholds -> _adjust_project -> _adjust has 4 function layers for what is essentially 'compute adjustment, apply it'. Flatten."
+            dependencies: ["p3.d2.t3"]
+            files: ["carry_forward.py"]
+          - id: "p3.d3.t2"
+            title: "Flatten auto_record_outcomes chain"
+            status: "todo"
+            description: "Trace and flatten the 6-layer chain in auto_record_outcomes"
+            dependencies: ["p3.d2.t3"]
+            files: ["carry_forward.py"]
+          - id: "p3.d3.t3"
+            title: "Run full test suite"
+            status: "todo"
+            description: "All 223 tests must pass"
+            dependencies: ["p3.d3.t1", "p3.d3.t2"]
+            files: []
+    dependencies:
+      - source: "phase-1"
+        target: "phase-3"
+        type: "soft"
+        reason: "Phase 1 consolidation may reduce some depth naturally"
+      - source: "phase-2"
+        target: "phase-3"
+        type: "soft"
+        reason: "Phase 2 may flatten cmd_context depth naturally"
+    scope_lines_total: 3100
+    test_target: 223
+    technical_notes: |
+      The abstraction depth problem is the core signal. 15 findings. But fixing it is
+      the highest-risk phase because it touches the decision pipeline. Go slow,
+      test after every change.
+      
+      Key insight: many of these layers exist because phases were added incrementally.
+      Phase 1 (stalls) + Phase 4 (noops) + Phase 3 (test regression) each added a check
+      function, and check_can_continue calls them all. The result is deep but narrow
+      call trees. Consolidating checks into fewer, wider functions would reduce depth
+      without losing clarity.
+    risks:
+      - "Touching check_can_continue is high-risk -- it's the core decision engine"
+      - "Tests may depend on internal function names in mocks"
+      - "Flattening too aggressively makes individual checks harder to test in isolation"
+
+  - id: "phase-4"
+    title: "Re-run overengineered audit"
+    status: "planned"
+    goal: "Verify all 7 signals. Target: <=3/7 signals flagged, 0 severe, no parallel implementations."
+    description: |
+      After phases 1-3, re-run the overengineered tool against the codebase. 
+      Measure: how many signals fire now? What's the verdict?
+      
+      Success criteria:
+      - 0 severe findings
+      - 0 parallel_implementations findings
+      - <=2 abstraction_depth findings (mild only)
+      - Verdict drops from "Severely overengineered" to "Slightly over" or better
+      - 223 tests still green
+      - Total LOC reduced by 200+ from current 4142
+    deliverables:
+      - name: "Audit results"
+        description: "Re-run overengineered.py and document the improvement"
+        status: "todo"
+        acceptance_criteria:
+          - description: "0 severe findings"
+            validation: "python3 overengineered.py --json | check severe_count == 0"
+            met: false
+          - description: "0 parallel_implementations"
+            validation: "python3 overengineered.py --json | check parallel_implementations count == 0"
+            met: false
+          - description: "223 tests pass"
+            validation: "pytest tests/ -q"
+            met: false
+          - description: "Source lines < 3950"
+            validation: "wc -l carry_forward.py"
+            met: false
+        tasks:
+          - id: "p4.d1.t1"
+            title: "Run overengineered audit and record results"
+            status: "todo"
+            description: "Run full audit, save JSON results, compare to baseline (5/7 signals, 3 severe, 12 significant, 21 mild)"
+            dependencies: []
+            files: []
+          - id: "p4.d1.t2"
+            title: "Fix any remaining low-hanging fruit"
+            status: "todo"
+            description: "If there are still easy wins (mild findings that take <5 minutes each), knock them out."
+            dependencies: ["p4.d1.t1"]
+            files: ["carry_forward.py"]
+          - id: "p4.d1.t3"
+            title: "Update ROADMAP.md and version to v7.0.0"
+            status: "todo"
+            description: "Update the roadmap markdown, bump version, document what changed."
+            dependencies: ["p4.d1.t2"]
+            files: ["ROADMAP.md"]
+    dependencies:
+      - source: "phase-1"
+        target: "phase-4"
+        type: "hard"
+        reason: "Must complete simplification before measuring"
+      - source: "phase-2"
+        target: "phase-4"
+        type: "hard"
+        reason: "Must complete simplification before measuring"
+      - source: "phase-3"
+        target: "phase-4"
+        type: "hard"
+        reason: "Must complete simplification before measuring"
+    scope_lines_total: 3950
+    test_target: 223
+
+global_risks:
+  - "4142-line single file makes refactoring risky -- consider splitting into modules after v7"
+  - "223 tests are the safety net -- any test breakage must be fixed before proceeding"
+  - "carry_forward.py is chmod u+w needed on some systems"
+  - "The chain script (~/zion/scripts/chain) depends on carry_forward CLI interface -- don't change argument signatures"
+
+conventions:
+  - "Every change must keep all 223 tests green"
+  - "No new external dependencies"
+  - "Python 3.10+"
+  - "CLI argument signatures must not change (chain script depends on them)"
+  - "Test before every commit in each phase"
+
+meta:
+  baseline_overengineering_score: "5/7 signals, 3 severe, 12 significant, 21 mild, 322 waste lines"
+  target_overengineering_score: "<=3/7 signals, 0 severe, 0 significant parallel_impl, verdict='Slightly over' or better"
+  baseline_loc: 4142
+  target_loc: 3950
+  baseline_tests: 223
+  target_tests: 223
