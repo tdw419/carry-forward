@@ -10,11 +10,11 @@ It is NOT: a task manager, an orchestrator, a workflow engine, or a prompt build
 
 ```
 carry_forward/
-├── carry_forward.py         # Core: 3100+ lines, all logic
+├── carry_forward.py         # Core: 3600+ lines, all logic
 ├── roadmap_integration.py   # Bridge: reads roadmap.yaml files for progress
 ├── replay_harness.py        # Testing: backtests decisions against history
 ├── tests/
-│   ├── test_carry_forward.py    # 148 unit tests
+│   ├── test_carry_forward.py    # 181 unit tests
 │   └── test_replay_harness.py   # 15 replay tests
 ├── ROADMAP.md                # Phases and priorities
 ├── AI_GUIDE.md               # This file
@@ -44,6 +44,7 @@ carry_forward.py record-outcome [SESSION_ID]  # Record decision outcome
 carry_forward.py calibrate                    # Auto-tune thresholds
 carry_forward.py health [--json]              # Session health dashboard for today
 carry_forward.py roadmap                      # Show project roadmap progress
+carry_forward.py analyze-patterns [DIR]       # Extract file-level patterns from session history
 ```
 
 ## Decision Pipeline (check_can_continue)
@@ -144,7 +145,21 @@ CLI: `carry_forward.py health [--json]`
 ## Test Command
 
 ```bash
-python3 -m pytest              # run all 185 tests
+python3 -m pytest              # run all 196 tests
 python3 -m pytest tests/test_carry_forward.py  # just core tests
 python3 replay_harness.py      # backtest against history
 ```
+
+## Technical Pattern Extraction (Phase 10)
+
+`extract_technical_patterns()` scans recent session messages for file paths, correlates with decision_outcomes to identify files/directories that correlate with productive vs unproductive sessions.
+
+Two pattern types:
+- **failure_hotspot**: file/directory appears in 3+ sessions with <40% success rate
+- **reliable_area**: file/directory appears in 3+ sessions with >80% success rate
+
+Patterns are stored as lessons (category = 'failure_hotspot' or 'reliable_area') and surfaced in `cmd_context` and `cmd_learn`.
+
+CLI: `carry_forward.py analyze-patterns [/path/to/project]`
+
+Also available via `get_top_technical_patterns(n)` for programmatic access.

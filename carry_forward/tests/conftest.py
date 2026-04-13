@@ -261,3 +261,14 @@ def insert_project_threshold(carry_db, project_dir, key, value, source="calibrat
     )
     conn.commit()
     conn.close()
+
+
+def insert_messages(state_db, session_id, role, content):
+    """Insert a message into the state DB for a session."""
+    conn = sqlite3.connect(state_db)
+    conn.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+        (session_id, role, content, time.time())
+    )
+    conn.commit()
+    conn.close()

@@ -24,6 +24,7 @@ Usage:
     carry_forward.py show-config [--project DIR]     # Show current threshold values
     carry_forward.py health [--json]                 # Session health dashboard for today
     carry_forward.py roadmap                      # Show roadmap progress for detected projects
+    carry_forward.py analyze-patterns [DIR]       # Extract file-level patterns from session history
 """
 import sqlite3
 import subprocess
@@ -2050,14 +2051,436 @@ def cmd_show_config(project_dir: Optional[str] = None) -> None:
             print(f"    {pkey} = {pval}  (source: {psrc}, since {ts_str})")
 
 
+
+# ---------------------------------------------------------------------------
+# Phase 10: Technical pattern extraction
+# ---------------------------------------------------------------------------
+
+
+def extract_technical_patterns(project_dir: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Extract file-level patterns from session history, correlated with outcomes.
+
+    Scans recent session tool messages for file paths, then joins with
+    decision_outcomes to identify which files/directories correlate with
+    productive vs unproductive sessions.
+
+    Returns a list of pattern dicts with keys:
+        path, total_sessions, productive, unproductive, success_rate, category
+    """
+    conn = get_conn()
+    carry_conn = get_carry_conn()
+
+    # Get recent sessions with outcomes
+    rows = carry_conn.execute("""
+        SELECT dl.session_id, do_out.outcome_productive, do_out.outcome_tool_calls
+        FROM decision_outcomes do_out
+        JOIN decision_log dl ON do_out.decision_id = dl.id
+        ORDER BY do_out.checked_at DESC
+        LIMIT 100
+    """).fetchall()
+    carry_conn.close()
+
+    if len(rows) < 5:
+        return []
+
+    # For each session with an outcome, extract file paths from its messages
+    file_stats: Dict[str, Dict[str, int]] = {}  # path -> {productive, unproductive, total}
+    path_pattern = re.compile(r"/home/jericho/[a-zA-Z0-9_/.]+\.[a-z]{1,4}")
+
+    for session_id, productive, tool_calls in rows:
+        if tool_calls == 0:
+            continue  # skip sessions with no tool calls
+
+        # Get tool messages for this session
+        tool_rows = conn.execute("""
+            SELECT content FROM messages
+            WHERE session_id = ? AND role = 'tool'
+        """, (session_id,)).fetchall()
+        # Also get assistant messages (file paths often appear there)
+        asst_rows = conn.execute("""
+            SELECT content FROM messages
+            WHERE session_id = ? AND role = 'assistant'
+        """, (session_id,)).fetchall()
+
+        all_text = " ".join(r[0] or "" for r in tool_rows + asst_rows)
+        paths = set(path_pattern.findall(all_text))
+
+        # Filter by project if specified
+        if project_dir:
+            paths = {p for p in paths if p.startswith(project_dir)}
+
+        # Track per-directory stats (more stable than per-file)
+        dirs = set(p.rsplit("/", 1)[0] for p in paths if "/" in p)
+        # Also track specific files that appear frequently
+        files = paths
+
+        for entity in dirs | files:
+            if entity not in file_stats:
+                file_stats[entity] = {"productive": 0, "unproductive": 0, "total": 0}
+            file_stats[entity]["total"] += 1
+            if productive:
+                file_stats[entity]["productive"] += 1
+            else:
+                file_stats[entity]["unproductive"] += 1
+
+    conn.close()
+
+    # Filter to patterns with enough data points and interesting correlations
+    patterns = []
+    for path, stats in file_stats.items():
+        if stats["total"] < 3:
+            continue
+        success_rate = stats["productive"] / stats["total"]
+        # Only surface patterns that deviate significantly from baseline
+        if stats["unproductive"] >= 3 and success_rate < 0.4:
+            patterns.append({
+                "path": path,
+                "total_sessions": stats["total"],
+                "productive": stats["productive"],
+                "unproductive": stats["unproductive"],
+                "success_rate": round(success_rate, 2),
+                "category": "failure_hotspot",
+            })
+        elif stats["productive"] >= 3 and success_rate > 0.8:
+            patterns.append({
+                "path": path,
+                "total_sessions": stats["total"],
+                "productive": stats["productive"],
+                "unproductive": stats["unproductive"],
+                "success_rate": round(success_rate, 2),
+                "category": "reliable_area",
+            })
+
+    # Sort by total sessions (most evidence first)
+    patterns.sort(key=lambda p: p["total_sessions"], reverse=True)
+    return patterns[:20]
+
+
+def store_technical_patterns(patterns: List[Dict[str, Any]]) -> int:
+    """Store extracted patterns as lessons in the lessons table.
+
+    Returns the number of new/updated patterns stored.
+    """
+    if not patterns:
+        return 0
+
+    now = time.time()
+    carry_conn = get_carry_conn()
+    stored = 0
+
+    for p in patterns:
+        if p["category"] == "failure_hotspot":
+            lesson_text = (
+                f"{p['path']} appears in {p['total_sessions']} sessions with "
+                f"only {p['success_rate']:.0%} success rate -- consider smaller steps"
+            )
+        else:
+            lesson_text = (
+                f"{p['path']} is a reliable area ({p['success_rate']:.0%} success "
+                f"across {p['total_sessions']} sessions)"
+            )
+
+        # Upsert: check if similar lesson exists
+        existing = carry_conn.execute(
+            "SELECT id, hit_count FROM lessons WHERE category = ? AND lesson LIKE ?",
+            (p["category"], f"{p['path']}%")
+        ).fetchone()
+
+        if existing:
+            carry_conn.execute(
+                "UPDATE lessons SET hit_count = ?, last_hit = ?, evidence = ? WHERE id = ?",
+                (existing[1] + 1, now,
+                 f"{p['productive']}/{p['total_sessions']} productive",
+                 existing[0])
+            )
+        else:
+            carry_conn.execute(
+                "INSERT INTO lessons (lesson, category, evidence, hit_count, last_hit, created_at) "
+                "VALUES (?, ?, ?, 1, ?, ?)",
+                (lesson_text, p["category"],
+                 f"{p['productive']}/{p['total_sessions']} productive",
+                 now, now)
+            )
+            stored += 1
+
+    carry_conn.commit()
+    carry_conn.close()
+    return stored
+
+
+def cmd_analyze_patterns(project_dir: Optional[str] = None) -> None:
+    """CLI command: analyze technical patterns from session history."""
+    patterns = extract_technical_patterns(project_dir)
+
+    if not patterns:
+        print("No technical patterns found -- need at least 5 sessions with outcomes.")
+        return
+
+    # Categorize
+    hotspots = [p for p in patterns if p["category"] == "failure_hotspot"]
+    reliable = [p for p in patterns if p["category"] == "reliable_area"]
+
+    if hotspots:
+        print("=== FAILURE HOTSPOTS (low success rate) ===\n")
+        for p in hotspots[:10]:
+            print(f"  {p['path']}")
+            print(f"    {p['productive']}/{p['total_sessions']} productive ({p['success_rate']:.0%})")
+            print()
+
+    if reliable:
+        print("=== RELIABLE AREAS (high success rate) ===\n")
+        for p in reliable[:10]:
+            print(f"  {p['path']}")
+            print(f"    {p['productive']}/{p['total_sessions']} productive ({p['success_rate']:.0%})")
+            print()
+
+    if not hotspots and not reliable:
+        print("No strong patterns detected.")
+
+    # Store as lessons
+    stored = store_technical_patterns(patterns)
+    if stored:
+        print(f"Stored {stored} new technical patterns as lessons.")
+
+
+def get_top_technical_patterns(n: int = 3) -> List[Dict[str, Any]]:
+    """Get the top N technical patterns from the lessons table.
+
+    These are lessons with category 'failure_hotspot' or 'reliable_area'.
+    """
+    carry_conn = get_carry_conn()
+    try:
+        rows = carry_conn.execute("""
+            SELECT lesson, category, evidence, hit_count, last_hit
+            FROM lessons
+            WHERE category IN ('failure_hotspot', 'reliable_area')
+            ORDER BY hit_count DESC, last_hit DESC
+            LIMIT ?
+        """, (n,)).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    carry_conn.close()
+
+    return [
+        {"lesson": r[0], "category": r[1], "evidence": r[2], "hit_count": r[3]}
+        for r in rows
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Phase 7: Per-project calibration from outcome data
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Phase 11: Next-task suggestion
+# ---------------------------------------------------------------------------
+
+def suggest_next(project_dir: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Suggest the next task to work on based on three signals.
+
+    Signals (in priority order):
+    1. Last session context -- what the most recent session was working on
+    2. Uncommitted changes -- files modified but not committed (abandoned work)
+    3. Roadmap gaps -- unchecked deliverables in project roadmap.yaml
+
+    Returns a ranked list of up to 3 candidate task dicts, each with:
+        source, confidence, description, details
+    """
+    candidates = []
+    conn = get_conn()
+
+    # Signal 1: Last session context
+    cur = conn.execute("""
+        SELECT id, title, parent_session_id
+        FROM sessions
+        WHERE tool_call_count > 0 AND source IN ('cli', 'telegram', 'whatsapp', 'cron')
+        ORDER BY started_at DESC LIMIT 3
+    """)
+    recent_sessions = cur.fetchall()
+
+    if recent_sessions:
+        # Look at the most recent session's last assistant messages
+        latest_id = recent_sessions[0][0]
+        last_msgs = get_last_assistant_messages(latest_id, count=3, max_chars=2000)
+
+        if last_msgs:
+            # Extract file paths from last messages to identify what was being worked on
+            all_last_text = " ".join(last_msgs)
+            path_pattern = re.compile(r"/home/jericho/[a-zA-Z0-9_/.]+\.[a-z]{1,4}")
+            paths = set(path_pattern.findall(all_last_text))
+
+            # Filter by project if specified
+            if project_dir:
+                paths = {p for p in paths if p.startswith(project_dir)}
+
+            if paths:
+                # Check if this session was productive (has an outcome)
+                carry_conn = get_carry_conn()
+                outcome = carry_conn.execute("""
+                    SELECT do_out.outcome_productive
+                    FROM decision_outcomes do_out
+                    JOIN decision_log dl ON do_out.decision_id = dl.id
+                    WHERE dl.session_id = ?
+                    ORDER BY do_out.checked_at DESC LIMIT 1
+                """, (latest_id,)).fetchone()
+                carry_conn.close()
+
+                was_productive = bool(outcome[0]) if outcome else None
+
+                # Summarize the files for the description
+                file_names = [p.rsplit("/", 1)[-1] for p in sorted(paths)[:5]]
+                dirs = sorted(set(p.rsplit("/", 1)[0] for p in paths))[:3]
+                dir_names = [d.rsplit("/", 1)[-1] for d in dirs]
+
+                if was_productive is False:
+                    desc = f"Resume work on {', '.join(dir_names)} -- last session was unproductive"
+                    confidence = 0.9
+                elif was_productive is True:
+                    desc = f"Continue successful work on {', '.join(dir_names)}"
+                    confidence = 0.7
+                else:
+                    desc = f"Pick up where last session left off: {', '.join(dir_names)}"
+                    confidence = 0.6
+
+                candidates.append({
+                    "source": "last_session",
+                    "confidence": confidence,
+                    "description": desc,
+                    "details": {
+                        "session_id": latest_id,
+                        "files": sorted(paths)[:10],
+                        "productive": was_productive,
+                    },
+                })
+            else:
+                # No files found, but still has context from messages
+                snippet = last_msgs[-1][:200].strip() if last_msgs else ""
+                if snippet:
+                    candidates.append({
+                        "source": "last_session",
+                        "confidence": 0.4,
+                        "description": f"Resume last session's work: {snippet}",
+                        "details": {"session_id": latest_id},
+                    })
+
+    # Signal 2: Uncommitted changes (dirty working copy)
+    if project_dir:
+        gs = git_status(project_dir)
+        dirty_files = gs.get("dirty_files", [])
+        if dirty_files:
+            # These files have changes that haven't been committed
+            file_names = [f.split("/")[-1] for f in sorted(dirty_files)[:5]]
+            candidates.append({
+                "source": "uncommitted_changes",
+                "confidence": 0.8,
+                "description": f"Address {len(dirty_files)} uncommitted file(s): {', '.join(file_names)}",
+                "details": {
+                    "files": sorted(dirty_files)[:10],
+                    "total_dirty": len(dirty_files),
+                },
+            })
+    elif recent_sessions:
+        # No project specified -- check all detected project dirs from recent sessions
+        cur2 = conn.execute("""
+            SELECT content FROM messages
+            WHERE session_id = ? AND role IN ('tool', 'assistant')
+        """, (recent_sessions[0][0],))
+        rows = cur2.fetchall()
+        all_text = " ".join(r[0] or "" for r in rows)
+        all_paths = set(re.findall(r"/home/jericho/[a-zA-Z0-9_/.]+\.[a-z]{1,4}", all_text))
+        all_dirs = sorted(set(p.rsplit("/", 1)[0] for p in all_paths))[:10]
+
+        for d in all_dirs:
+            gs = git_status(d)
+            if not gs.get("error") and gs.get("git_root") and gs.get("dirty"):
+                dirty_files = gs.get("dirty_files", [])
+                if dirty_files:
+                    root = gs["git_root"]
+                    file_names = [f.split("/")[-1] for f in sorted(dirty_files)[:5]]
+                    candidates.append({
+                        "source": "uncommitted_changes",
+                        "confidence": 0.8,
+                        "description": f"Commit or fix {len(dirty_files)} dirty file(s) in {root}: {', '.join(file_names)}",
+                        "details": {
+                            "project": root,
+                            "files": sorted(dirty_files)[:10],
+                        },
+                    })
+                    break  # just report the first dirty project
+
+    # Signal 3: Roadmap gaps (next unchecked deliverable)
+    target_dirs = [project_dir] if project_dir else []
+    if not target_dirs and recent_sessions:
+        # Auto-detect project dirs from recent sessions
+        cur3 = conn.execute("""
+            SELECT content FROM messages
+            WHERE session_id = ? AND role IN ('tool', 'assistant')
+        """, (recent_sessions[0][0],))
+        rows3 = cur3.fetchall()
+        text3 = " ".join(r[0] or "" for r in rows3)
+        paths3 = set(re.findall(r"/home/jericho/[a-zA-Z0-9_/.]+\.[a-z]{1,4}", text3))
+        target_dirs = sorted(set(p.rsplit("/", 1)[0] for p in paths3))[:5]
+
+    if HAS_ROADMAP_BUILDER and target_dirs:
+        roadmaps = scan_project_roadmaps(target_dirs)
+        for rm in roadmaps:
+            if rm.get("next_deliverables"):
+                first_next = rm["next_deliverables"][0]
+                phase_name = rm.get("current_phase", "unknown phase")
+                candidates.append({
+                    "source": "roadmap",
+                    "confidence": 0.6,
+                    "description": f"Roadmap next: {first_next.get('name', 'unnamed')} (phase: {phase_name})",
+                    "details": {
+                        "project": rm.get("project_dir", ""),
+                        "phase": phase_name,
+                        "deliverable": first_next,
+                    },
+                })
+                break  # one roadmap suggestion is enough
+
+    # Fallback: if no candidates, check for failure hotspots
+    if not candidates:
+        hotspots = [p for p in extract_technical_patterns(project_dir)
+                    if p["category"] == "failure_hotspot"]
+        if hotspots:
+            top = hotspots[0]
+            candidates.append({
+                "source": "failure_hotspot",
+                "confidence": 0.5,
+                "description": f"Investigate failure hotspot: {top['path']} ({top['success_rate']:.0%} success)",
+                "details": top,
+            })
+
+    # Sort by confidence (descending) and return top 3
+    candidates.sort(key=lambda c: c["confidence"], reverse=True)
+    conn.close()
+    return candidates[:3]
+
+
+def cmd_suggest_next(project_dir: Optional[str] = None) -> None:
+    """CLI command: suggest the next task to work on."""
+    suggestions = suggest_next(project_dir)
+
+    if not suggestions:
+        print("No task suggestions available -- need more session history or project context.")
+        return
+
+    print("=== SUGGESTED NEXT TASKS ===\n")
+    for i, s in enumerate(suggestions, 1):
+        conf_bar = "=" * int(s["confidence"] * 10)
+        print(f"  {i}. [{s['source']}] (confidence: {s['confidence']:.0%})")
+        print(f"     {s['description']}")
+        if s.get("details", {}).get("files"):
+            print(f"     Files: {', '.join(s['details']['files'][:5])}")
+        print()
+
+
+
 def calibrate_project_thresholds(project_dir: str, dry_run: bool = False) -> Dict[str, Any]:
     """Calibrate thresholds for a specific project based on its outcome data.
 
-    Uses the same calibration logic as calibrate_thresholds() but scoped to
+     Uses the same calibration logic as calibrate_thresholds() but scoped to
     decisions that involved this project (matched via chain_git_heads.project_dir).
 
     If there are fewer than 5 outcomes for this project, seeds from
@@ -2787,6 +3210,25 @@ def cmd_context(include_cron: bool = False) -> None:
                 print(f"    ({lesson['evidence']})")
         print()
 
+    # v10: Technical patterns from file-outcome correlation
+    tech_patterns = get_top_technical_patterns(n=3)
+    if tech_patterns:
+        print("=== TECHNICAL PATTERNS ===")
+        for tp in tech_patterns:
+            label = "WARNING" if tp["category"] == "failure_hotspot" else "OK"
+            print(f"  [{label}] {tp['lesson']}")
+            if tp.get("evidence"):
+                print(f"    ({tp['evidence']})")
+        print()
+
+    # v11: Next-task suggestions
+    suggestions = suggest_next()
+    if suggestions:
+        print("=== SUGGESTED NEXT TASKS ===")
+        for i, s in enumerate(suggestions, 1):
+            print(f"  {i}. [{s['source']}] ({s['confidence']:.0%}) {s['description']}")
+        print()
+
 
 # ---------------------------------------------------------------------------
 # Command: health (Phase 9: Session health dashboard)
@@ -3258,6 +3700,8 @@ def get_context_data(session_id: Optional[str] = None, include_cron: bool = Fals
         "blockers": [{"message": m, "created": ts, "age_hours": (time.time() - ts) / 3600 if ts else None} for m, ts in blockers],
         "roadmaps": roadmap_data,
         "learned_lessons": get_top_lessons(n=3),
+        "technical_patterns": get_top_technical_patterns(n=3),
+        "suggested_next": suggest_next(),
     }
 
 
@@ -3383,9 +3827,25 @@ if __name__ == "__main__":
     elif cmd == "health":
         cmd_health(json_output="--json" in sys.argv)
 
+    elif cmd == "analyze-patterns":
+        project = None
+        if "--project" in sys.argv:
+            idx = sys.argv.index("--project")
+            if idx + 1 < len(sys.argv):
+                project = sys.argv[idx + 1]
+        elif len(sys.argv) > 2 and not sys.argv[2].startswith("--"):
+            project = sys.argv[2]
+        cmd_analyze_patterns(project)
+
     elif cmd == "roadmap":
         sid = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else None
         cmd_roadmap(sid)
+
+    elif cmd == "suggest-next":
+        project = None
+        if len(sys.argv) > 2 and not sys.argv[2].startswith("--"):
+            project = sys.argv[2]
+        cmd_suggest_next(project)
 
     else:
         print(f"Unknown command: {cmd}")

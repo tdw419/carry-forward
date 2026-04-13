@@ -2,7 +2,7 @@
 
 **Purpose:** Carry Forward is the decision engine that keeps Hermes autonomous loops productive. It answers one question: "should we spawn another session?" It's not an orchestrator, not a task manager -- it's a governor.
 
-**Current state:** v5.6.0, 3100+ lines, 185 tests, 9 guard rail phases built. Powering the generic `chain` script across multiple projects.
+**Current state:** v5.8.0, 3840+ lines, 195 tests, 11 guard rail phases built. Powering the generic `chain` script across multiple projects.
 
 ## What Works
 
@@ -15,6 +15,8 @@
 - Project-aware thresholds (Phase 7)
 - Test command discovery (Phase 8)
 - Session health dashboard (Phase 9)
+- Technical pattern extraction (Phase 10)
+- Next-task suggestion (Phase 11)
 - Roadmap integration (scan project roadmaps, completion signals)
 - Context extraction from session DB
 - `check-can-continue` 5-stage decision pipeline
@@ -26,11 +28,17 @@ The engine is solid for "should we continue?" but weak on "what should we do nex
 
 ## Priority Order for Automated Development
 
-- [x] Phase 5: Outcome tracking -- auto_record_outcomes runs after every chain cycle, records whether the next session was productive (committed code, tests passed). Feed this back into threshold calibration. Currently record_outcome exists but is never called automatically.
-- [x] Phase 6: Smarter context -- context command includes top 3 lessons from outcome history (e.g. "this project fails on phases involving vm.rs changes -- use smaller steps"). Currently context is purely factual, no learned intelligence.
-- [x] Phase 7: Project-aware thresholds -- different projects need different stall/noop thresholds. A Rust project with cargo test takes longer per cycle than a Python project. Calibrate per-project from outcome data.
-- [x] Phase 8: Test command discovery -- detect project test commands (cargo test, npm test, pytest, make test) and surface them in context so the agent doesn't have to guess. The `chain` script already does this; carry_forward should too.
-- [x] Phase 9: Session health dashboard -- a simple CLI command that shows: sessions run today, tests pass rate, commits landed, time wasted on failed cycles. One command to answer "how's the loop doing?"
+- [x] Phase 5: Outcome tracking -- auto_record_outcomes runs after every chain cycle
+- [x] Phase 6: Smarter context -- context command includes top 3 lessons
+- [x] Phase 7: Project-aware thresholds -- different projects need different thresholds
+- [x] Phase 8: Test command discovery -- detect project test commands
+- [x] Phase 9: Session health dashboard -- daily snapshot
+
+### Next Frontier
+
+- [x] Phase 10: Technical pattern extraction -- lessons about *what* was worked on, not just whether sessions were productive. Track which files/directories appear in failed sessions vs successful ones. Surface "geometry_os/src/vm.rs appears in 8/10 failed sessions" as a lesson. New command `analyze-patterns` that scans session messages for file paths and correlates with outcomes.
+- [x] Phase 11: Next-task suggestion -- when `chain` runs out of roadmap items (all checked), carry_forward should suggest the next logical task by analyzing: (a) what files were recently changed, (b) what the last session was working on when it stopped, (c) what uncommitted files exist. New command `suggest-next [project_dir]` that returns a ranked list of 3 candidate tasks with confidence scores. Also surfaces in `context` output and `get_context_data` JSON.
+- [ ] Phase 12: Failure fingerprinting -- when a session is marked unproductive, scan its tool calls for common failure patterns: build errors, test failures, timeout kills, compilation errors. Store failure fingerprints and surface them in context: "last 3 failures on this project were all compilation errors in src/parser.rs." New command `analyze-failures [project_dir]`.
 
 ## Design Principles
 
@@ -43,5 +51,5 @@ The engine is solid for "should we continue?" but weak on "what should we do nex
 
 - Every new guard rail gets a test in tests/test_carry_forward.py
 - Every new CLI command gets a test
-- 185 tests must stay green
+- 195 tests must stay green
 - Python 3.10+, no external dependencies for core (roadmap_builder is optional)
