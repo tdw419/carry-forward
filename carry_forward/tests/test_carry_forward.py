@@ -1187,6 +1187,79 @@ class TestGetTopLessons:
         assert len(result) == 3
 
 
+class TestGetTopKnowledge:
+    """Tests for get_top_knowledge() -- generic knowledge query function."""
+
+    def test_lessons_table(self, carry_db, patched_env):
+        """get_top_knowledge('lessons', n) should return same as get_top_lessons."""
+        insert_lesson(carry_db, "Lesson A", hit_count=5)
+        insert_lesson(carry_db, "Lesson B", hit_count=3)
+
+        result = patched_env.get_top_knowledge('lessons', n=2)
+        assert len(result) == 2
+        assert result[0]["lesson"] == "Lesson A"
+        assert result[0]["hit_count"] == 5
+
+    def test_technical_patterns_table(self, carry_db, patched_env):
+        """get_top_knowledge('technical_patterns', n) should filter to failure_hotspot/reliable_area."""
+        insert_lesson(carry_db, "Normal lesson", category="general", hit_count=10)
+        insert_lesson(carry_db, "Hotspot", category="failure_hotspot", hit_count=3)
+
+        result = patched_env.get_top_knowledge('technical_patterns', n=5)
+        assert len(result) == 1
+        assert result[0]["category"] == "failure_hotspot"
+
+    def test_failure_fingerprints_table(self, carry_db, patched_env):
+        """get_top_knowledge('failure_fingerprints', n) should aggregate by type."""
+        import sqlite3
+        conn = sqlite3.connect(carry_db)
+        now = time.time()
+        for i in range(3):
+            conn.execute(
+                "INSERT INTO failure_fingerprints (session_id, fingerprint_type, file_path, snippet, project_dir, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (f"s{i}", "compilation_error", "/home/x.rs", "err", None, now)
+            )
+        conn.commit()
+        conn.close()
+
+        result = patched_env.get_top_knowledge('failure_fingerprints', n=5)
+        assert len(result) == 1
+        assert result[0]["type"] == "compilation_error"
+        assert result[0]["count"] == 3
+
+    def test_failure_fingerprints_with_project_dir(self, carry_db, patched_env):
+        """get_top_knowledge('failure_fingerprints', n, project_dir) should filter."""
+        import sqlite3
+        conn = sqlite3.connect(carry_db)
+        now = time.time()
+        conn.execute(
+            "INSERT INTO failure_fingerprints (session_id, fingerprint_type, file_path, snippet, project_dir, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("s1", "test_failure", "/a.rs", "FAIL", "/home/proj", now)
+        )
+        conn.execute(
+            "INSERT INTO failure_fingerprints (session_id, fingerprint_type, file_path, snippet, project_dir, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("s2", "compilation_error", "/b.rs", "ERR", "/home/other", now)
+        )
+        conn.commit()
+        conn.close()
+
+        result = patched_env.get_top_knowledge('failure_fingerprints', n=5, project_dir="/home/proj")
+        assert len(result) == 1
+        assert result[0]["type"] == "test_failure"
+
+    def test_unknown_table_raises(self, carry_db, patched_env):
+        """get_top_knowledge with unknown table should raise ValueError."""
+        import pytest
+        with pytest.raises(ValueError, match="Unknown knowledge table"):
+            patched_env.get_top_knowledge('nonexistent', n=3)
+
+    def test_empty_table_returns_empty(self, carry_db, patched_env):
+        """Empty table should return empty list."""
+        assert patched_env.get_top_knowledge('lessons', n=3) == []
+        assert patched_env.get_top_knowledge('technical_patterns', n=3) == []
+        assert patched_env.get_top_knowledge('failure_fingerprints', n=3) == []
+
+
 class TestLessonsInContext:
     """Tests that lessons appear in context command output."""
 

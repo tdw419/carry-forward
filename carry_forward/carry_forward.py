@@ -1824,39 +1824,105 @@ def extract_lessons() -> List[Dict[str, Any]]:
     return new_lessons
 
 
-def get_top_lessons(n: int = 3) -> List[Dict[str, Any]]:
-    """Return the top N lessons from the lessons table, ranked by hit_count and recency.
+def get_top_knowledge(table: str, n: int = 3,
+                      project_dir: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Generic knowledge query -- SELECT from a table, ORDER BY, LIMIT n.
+
+    Supported table values:
+        'lessons'              -- top lessons ranked by hit_count/recency
+        'technical_patterns'   -- lessons with category failure_hotspot/reliable_area
+        'failure_fingerprints' -- aggregated failure types, optionally filtered by project_dir
 
     Args:
-        n: Max number of lessons to return (default 3).
+        table: One of 'lessons', 'technical_patterns', 'failure_fingerprints'.
+        n: Max rows to return.
+        project_dir: Optional project filter (only used by failure_fingerprints).
 
     Returns:
-        List of dicts with 'lesson', 'category', 'evidence', 'hit_count' keys.
+        List of dicts. Shape depends on table:
+        - lessons/technical_patterns: {lesson, category, evidence, hit_count}
+        - failure_fingerprints: {type, count, files, example, last_seen}
     """
     carry_conn = get_carry_conn()
 
-    # Check if lessons table exists (handles fresh DBs)
     try:
-        rows = carry_conn.execute("""
-            SELECT lesson, category, evidence, hit_count, last_hit
-            FROM lessons
-            ORDER BY hit_count DESC, last_hit DESC
-            LIMIT ?
-        """, (n,)).fetchall()
+        if table == 'lessons':
+            rows = carry_conn.execute("""
+                SELECT lesson, category, evidence, hit_count, last_hit
+                FROM lessons
+                ORDER BY hit_count DESC, last_hit DESC
+                LIMIT ?
+            """, (n,)).fetchall()
+            carry_conn.close()
+            return [
+                {"lesson": r[0], "category": r[1],
+                 "evidence": r[2], "hit_count": r[3]}
+                for r in rows
+            ]
+
+        elif table == 'technical_patterns':
+            rows = carry_conn.execute("""
+                SELECT lesson, category, evidence, hit_count, last_hit
+                FROM lessons
+                WHERE category IN ('failure_hotspot', 'reliable_area')
+                ORDER BY hit_count DESC, last_hit DESC
+                LIMIT ?
+            """, (n,)).fetchall()
+            carry_conn.close()
+            return [
+                {"lesson": r[0], "category": r[1],
+                 "evidence": r[2], "hit_count": r[3]}
+                for r in rows
+            ]
+
+        elif table == 'failure_fingerprints':
+            if project_dir:
+                rows = carry_conn.execute("""
+                    SELECT fingerprint_type, COUNT(*) as cnt,
+                           GROUP_CONCAT(DISTINCT file_path) as files,
+                           MAX(snippet) as example,
+                           MAX(created_at) as last_seen
+                    FROM failure_fingerprints
+                    WHERE project_dir = ? OR project_dir IS NULL
+                    GROUP BY fingerprint_type
+                    ORDER BY cnt DESC, last_seen DESC
+                    LIMIT ?
+                """, (project_dir, n)).fetchall()
+            else:
+                rows = carry_conn.execute("""
+                    SELECT fingerprint_type, COUNT(*) as cnt,
+                           GROUP_CONCAT(DISTINCT file_path) as files,
+                           MAX(snippet) as example,
+                           MAX(created_at) as last_seen
+                    FROM failure_fingerprints
+                    GROUP BY fingerprint_type
+                    ORDER BY cnt DESC, last_seen DESC
+                    LIMIT ?
+                """, (n,)).fetchall()
+            carry_conn.close()
+            return [
+                {
+                    "type": r[0],
+                    "count": r[1],
+                    "files": (r[2] or "").split(",")[:5] if r[2] else [],
+                    "example": r[3],
+                    "last_seen": r[4],
+                }
+                for r in rows
+            ]
+
+        else:
+            carry_conn.close()
+            raise ValueError(f"Unknown knowledge table: {table}")
+
     except sqlite3.OperationalError:
-        rows = []
+        carry_conn.close()
+        return []
 
-    carry_conn.close()
 
-    return [
-        {
-            "lesson": r[0],
-            "category": r[1],
-            "evidence": r[2],
-            "hit_count": r[3],
-        }
-        for r in rows
-    ]
+def get_top_lessons(n: int = 3) -> List[Dict[str, Any]]:
+    """Return the top N lessons from the lessons table, ranked by hit_count and recency."""
+    return get_top_knowledge('lessons', n)
 
 
 def cmd_learn() -> None:
@@ -2266,23 +2332,7 @@ def get_top_technical_patterns(n: int = 3) -> List[Dict[str, Any]]:
 
     These are lessons with category 'failure_hotspot' or 'reliable_area'.
     """
-    carry_conn = get_carry_conn()
-    try:
-        rows = carry_conn.execute("""
-            SELECT lesson, category, evidence, hit_count, last_hit
-            FROM lessons
-            WHERE category IN ('failure_hotspot', 'reliable_area')
-            ORDER BY hit_count DESC, last_hit DESC
-            LIMIT ?
-        """, (n,)).fetchall()
-    except sqlite3.OperationalError:
-        rows = []
-    carry_conn.close()
-
-    return [
-        {"lesson": r[0], "category": r[1], "evidence": r[2], "hit_count": r[3]}
-        for r in rows
-    ]
+    return get_top_knowledge('technical_patterns', n)
 
 
 # ---------------------------------------------------------------------------
@@ -2620,45 +2670,7 @@ def get_top_failure_fingerprints(project_dir: Optional[str] = None,
     Returns a summary of failure types with counts and example snippets,
     ordered by frequency.
     """
-    carry_conn = get_carry_conn()
-    try:
-        if project_dir:
-            rows = carry_conn.execute("""
-                SELECT fingerprint_type, COUNT(*) as cnt,
-                       GROUP_CONCAT(DISTINCT file_path) as files,
-                       MAX(snippet) as example,
-                       MAX(created_at) as last_seen
-                FROM failure_fingerprints
-                WHERE project_dir = ? OR project_dir IS NULL
-                GROUP BY fingerprint_type
-                ORDER BY cnt DESC, last_seen DESC
-                LIMIT ?
-            """, (project_dir, n)).fetchall()
-        else:
-            rows = carry_conn.execute("""
-                SELECT fingerprint_type, COUNT(*) as cnt,
-                       GROUP_CONCAT(DISTINCT file_path) as files,
-                       MAX(snippet) as example,
-                       MAX(created_at) as last_seen
-                FROM failure_fingerprints
-                GROUP BY fingerprint_type
-                ORDER BY cnt DESC, last_seen DESC
-                LIMIT ?
-            """, (n,)).fetchall()
-    except sqlite3.OperationalError:
-        rows = []
-    carry_conn.close()
-
-    return [
-        {
-            "type": r[0],
-            "count": r[1],
-            "files": (r[2] or "").split(",")[:5] if r[2] else [],
-            "example": r[3],
-            "last_seen": r[4],
-        }
-        for r in rows
-    ]
+    return get_top_knowledge('failure_fingerprints', n, project_dir=project_dir)
 
 
 def analyze_session_failures(project_dir: Optional[str] = None) -> List[Dict[str, Any]]:
