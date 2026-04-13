@@ -12,7 +12,7 @@ import pytest
 
 # Ensure conftest helpers are importable
 sys.path.insert(0, os.path.dirname(__file__))
-from conftest import insert_session, insert_blocker, insert_git_heads, insert_config, insert_chain, insert_tick_changes, insert_test_count, insert_decision, insert_outcome, insert_lesson  # noqa: E402
+from conftest import insert_session, insert_blocker, insert_git_heads, insert_config, insert_chain, insert_tick_changes, insert_test_count, insert_decision, insert_outcome, insert_lesson, insert_project_threshold  # noqa: E402
 
 
 # ===========================================================================
@@ -1274,3 +1274,326 @@ class TestCmdLearn:
         patched_env.cmd_learn()
         output = capsys.readouterr().out
         assert "LEARNED LESSONS" in output
+
+
+# ===========================================================================
+# Tests: Phase 7 -- Project-Aware Thresholds
+# ===========================================================================
+
+class TestDetectProjectType:
+    """Tests for detect_project_type()."""
+
+    def test_detect_rust_project(self, tmp_path, patched_env):
+        """Cargo.toml -> 'rust'."""
+        (tmp_path / "Cargo.toml").write_text("[package]\nname = 'test'\n")
+        (tmp_path / ".git").mkdir()
+        result = patched_env.detect_project_type(str(tmp_path))
+        assert result == "rust"
+
+    def test_detect_python_project(self, tmp_path, patched_env):
+        """pyproject.toml -> 'python'."""
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+        (tmp_path / ".git").mkdir()
+        result = patched_env.detect_project_type(str(tmp_path))
+        assert result == "python"
+
+    def test_detect_node_project(self, tmp_path, patched_env):
+        """package.json -> 'node'."""
+        (tmp_path / "package.json").write_text('{"name": "test"}')
+        (tmp_path / ".git").mkdir()
+        result = patched_env.detect_project_type(str(tmp_path))
+        assert result == "node"
+
+    def test_detect_from_subdir(self, tmp_path, patched_env):
+        """Detection should walk up to find marker files at git root."""
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "Cargo.toml").write_text("[package]\nname = 'test'\n")
+        subdir = tmp_path / "src"
+        subdir.mkdir()
+        result = patched_env.detect_project_type(str(subdir))
+        assert result == "rust"
+
+    def test_no_markers_returns_none(self, tmp_path, patched_env):
+        """No marker files -> None."""
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "README.md").write_text("hello")
+        result = patched_env.detect_project_type(str(tmp_path))
+        assert result is None
+
+    def test_nonexistent_dir_returns_none(self, patched_env):
+        """Non-existent directory -> None."""
+        result = patched_env.detect_project_type("/nonexistent/path/xyz")
+        assert result is None
+
+
+class TestGetThresholdForProject:
+    """Tests for get_threshold_for_project() -- resolution order."""
+
+    def test_falls_back_to_global_default(self, carry_db, patched_env):
+        """No project dir -> global default."""
+        val = patched_env.get_threshold_for_project("noop_limit")
+        assert val == 3  # default NOOP_LIMIT
+
+    def test_non_overridable_ignores_project(self, carry_db, patched_env):
+        """Non-overridable keys always use global, even with project_dir."""
+        # dead_session_threshold is NOT in PROJECT_OVERRIDABLE
+        val = patched_env.get_threshold_for_project(
+            "dead_session_threshold", "/some/project"
+        )
+        assert val == 3  # default
+
+    def test_project_threshold_overrides(self, carry_db, patched_env):
+        """Explicit project_thresholds entry overrides global."""
+        insert_project_threshold(carry_db, "/my/rust/proj", "noop_limit", 5)
+        val = patched_env.get_threshold_for_project("noop_limit", "/my/rust/proj")
+        assert val == 5
+
+    def test_unknown_threshold_raises(self, carry_db, patched_env):
+        """Unknown threshold key should raise ValueError."""
+        with pytest.raises(ValueError):
+            patched_env.get_threshold_for_project("nonexistent_key")
+
+    def test_global_config_still_works(self, carry_db, patched_env):
+        """Global config table overrides should still apply when no project override."""
+        insert_config(carry_db, "noop_limit", "5")
+        val = patched_env.get_threshold_for_project("noop_limit")
+        assert val == 5
+
+    def test_project_override_beats_global_config(self, carry_db, patched_env):
+        """Project-specific threshold should override global config."""
+        insert_config(carry_db, "noop_limit", "5")
+        insert_project_threshold(carry_db, "/my/proj", "noop_limit", "7")
+        val = patched_env.get_threshold_for_project("noop_limit", "/my/proj")
+        assert val == 7
+
+
+class TestGetAllThresholdsForProject:
+    """Tests for get_all_thresholds_for_project()."""
+
+    def test_returns_all_keys(self, carry_db, patched_env):
+        """Should return a value for every defined threshold."""
+        result = patched_env.get_all_thresholds_for_project()
+        assert len(result) == len(patched_env.THRESHOLD_DEFS)
+
+    def test_includes_project_overrides(self, carry_db, patched_env):
+        """Should include project-specific values where set."""
+        insert_project_threshold(carry_db, "/proj", "noop_limit", "6")
+        result = patched_env.get_all_thresholds_for_project("/proj")
+        assert result["noop_limit"] == 6
+        # Non-overridable should still be default
+        assert result["dead_session_threshold"] == 3
+
+
+class TestResolveProjectDir:
+    """Tests for _resolve_project_dir()."""
+
+    def test_from_chain_meta(self, state_db, carry_db, patched_env):
+        """Should find project_dir from chain_meta."""
+        conn = sqlite3.connect(carry_db)
+        conn.execute(
+            "INSERT INTO chain_meta (session_id, continuation_count, created_at, project_dir) VALUES (?, 0, ?, ?)",
+            ("test_sess", time.time(), "/my/project")
+        )
+        conn.commit()
+        conn.close()
+
+        result = patched_env._resolve_project_dir("test_sess")
+        assert result == "/my/project"
+
+    def test_from_git_heads_fallback(self, state_db, carry_db, patched_env):
+        """Should fall back to chain_git_heads when chain_meta has no project_dir."""
+        insert_git_heads(carry_db, "test_sess2", "/fallback/project", "abc123")
+
+        result = patched_env._resolve_project_dir("test_sess2")
+        assert result == "/fallback/project"
+
+    def test_none_when_no_data(self, state_db, carry_db, patched_env):
+        """Should return None when no project data exists."""
+        result = patched_env._resolve_project_dir("nonexistent_session")
+        assert result is None
+
+
+class TestCheckCanContinueProjectAware:
+    """Tests that check_can_continue uses project-aware thresholds."""
+
+    def test_project_dir_in_result(self, state_db, carry_db, patched_env):
+        """check_can_continue should include project_dir in result."""
+        insert_session(state_db, "proj_sess", msgs=10, tools=5)
+        insert_git_heads(carry_db, "proj_sess", "/my/project", "abc123")
+
+        result = patched_env.check_can_continue("proj_sess")
+        assert result["project_dir"] == "/my/project"
+
+    def test_project_dir_none_when_unknown(self, state_db, carry_db, patched_env):
+        """project_dir should be None when no project data exists."""
+        insert_session(state_db, "no_proj_sess", msgs=10, tools=5)
+
+        result = patched_env.check_can_continue("no_proj_sess")
+        assert result["project_dir"] is None
+
+    def test_stagnation_uses_project_threshold(self, state_db, carry_db, patched_env):
+        """Stagnation check should use project-specific stagnation_stall_limit."""
+        insert_config(carry_db, "git_min_sessions", "2")
+
+        # Set project threshold to 5 (higher than default 3)
+        insert_project_threshold(carry_db, "/rust/proj", "stagnation_stall_limit", 5)
+
+        # Build a chain with 4 consecutive stalls (would halt at default limit=3)
+        insert_session(state_db, "rs1", msgs=5, tools=2)
+        insert_session(state_db, "rs2", parent="rs1", msgs=5, tools=2)
+        insert_session(state_db, "rs3", parent="rs2", msgs=0, tools=0)
+        insert_session(state_db, "rs4", parent="rs3", msgs=0, tools=0)
+
+        # Same git head across all sessions = stalled
+        for sid in ["rs1", "rs2", "rs3", "rs4"]:
+            insert_git_heads(carry_db, sid, "/rust/proj", "abc123")
+
+        result = patched_env.check_can_continue("rs4")
+        # With project limit=5, 4 stalls should NOT trigger halt (but session is dead)
+        # The session itself is dead (0 tools, 0 msgs), so it halts for that reason.
+        # But stagnation_halt should be False because 4 < 5.
+        assert result["stagnation_halt"] is False
+
+    def test_noop_uses_project_threshold(self, state_db, carry_db, patched_env):
+        """Noop check should use project-specific noop_limit."""
+        # Set project threshold to 5 (higher than default 3)
+        insert_project_threshold(carry_db, "/slow/proj", "noop_limit", 5)
+
+        insert_session(state_db, "np1", msgs=5, tools=2)
+        insert_session(state_db, "np2", parent="np1", msgs=0, tools=0)
+
+        # Same git head = stalled, no test increase
+        insert_git_heads(carry_db, "np1", "/slow/proj", "abc123")
+        insert_git_heads(carry_db, "np2", "/slow/proj", "abc123")
+
+        result = patched_env.check_can_continue("np2")
+        # Session is dead (0 tools, 0 msgs), but noop_halt should not trigger
+        # because consecutive_noops is 1 and project limit is 5.
+        assert result["noop_halt"] is False
+
+
+class TestCalibrateProjectThresholds:
+    """Tests for calibrate_project_thresholds()."""
+
+    def test_seeds_from_type_defaults_when_no_data(self, carry_db, patched_env, tmp_path):
+        """When no outcomes for project, seed from PROJECT_TYPE_DEFAULTS."""
+        (tmp_path / "Cargo.toml").write_text("[package]\nname = 'test'\n")
+        (tmp_path / ".git").mkdir()
+
+        result = patched_env.calibrate_project_thresholds(str(tmp_path), dry_run=True)
+        assert result["project_type"] == "rust"
+        assert result["changes"]  # should have changes (rust defaults differ from global)
+
+    def test_seeds_no_changes_for_python(self, carry_db, patched_env, tmp_path):
+        """Python type has empty defaults -> no seeding changes."""
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+        (tmp_path / ".git").mkdir()
+
+        result = patched_env.calibrate_project_thresholds(str(tmp_path), dry_run=True)
+        assert result["project_type"] == "python"
+        assert result["changes"] == []
+
+    def test_calibrates_from_project_outcomes(self, carry_db, patched_env):
+        """Should calibrate from outcomes scoped to the project."""
+        # Create 6 productive continue outcomes for project sessions
+        for i in range(6):
+            dec_id = insert_decision(carry_db, f"proj_cal_{i}", "continue", True)
+            insert_outcome(carry_db, dec_id, f"proj_cal_{i}", productive=1)
+            insert_git_heads(carry_db, f"proj_cal_{i}", "/cal/proj", f"head_{i}")
+
+        result = patched_env.calibrate_project_thresholds("/cal/proj", dry_run=True)
+        assert result["summary"]["outcome_count"] == 6
+        # 100% productive -> should loosen (suggest higher limits)
+        assert any(c["new"] > c["old"] for c in result["changes"])
+
+    def test_dry_run_does_not_write(self, carry_db, patched_env):
+        """Dry run should not write to project_thresholds table."""
+        for i in range(6):
+            dec_id = insert_decision(carry_db, f"dry_{i}", "continue", True)
+            insert_outcome(carry_db, dec_id, f"dry_{i}", productive=1)
+            insert_git_heads(carry_db, f"dry_{i}", "/dry/proj", f"head_{i}")
+
+        patched_env.calibrate_project_thresholds("/dry/proj", dry_run=True)
+
+        conn = sqlite3.connect(carry_db)
+        rows = conn.execute("SELECT * FROM project_thresholds").fetchall()
+        conn.close()
+        assert len(rows) == 0
+
+    def test_actual_run_writes(self, carry_db, patched_env):
+        """Non-dry-run should write to project_thresholds table."""
+        for i in range(6):
+            dec_id = insert_decision(carry_db, f"wet_{i}", "continue", True)
+            insert_outcome(carry_db, dec_id, f"wet_{i}", productive=1)
+            insert_git_heads(carry_db, f"wet_{i}", "/wet/proj", f"head_{i}")
+
+        result = patched_env.calibrate_project_thresholds("/wet/proj", dry_run=False)
+        if result["changes"]:
+            conn = sqlite3.connect(carry_db)
+            rows = conn.execute("SELECT * FROM project_thresholds WHERE project_dir = ?", ("/wet/proj",)).fetchall()
+            conn.close()
+            assert len(rows) > 0
+
+    def test_tightens_on_bad_continue_rate(self, carry_db, patched_env):
+        """<50% productive continues should tighten thresholds."""
+        # 2 productive, 4 unproductive = 33%
+        for i in range(2):
+            dec_id = insert_decision(carry_db, f"bad_ok_{i}", "continue", True)
+            insert_outcome(carry_db, dec_id, f"bad_ok_{i}", productive=1)
+            insert_git_heads(carry_db, f"bad_ok_{i}", "/bad/proj", f"head_{i}")
+        for i in range(4):
+            dec_id = insert_decision(carry_db, f"bad_nok_{i}", "continue", True)
+            insert_outcome(carry_db, dec_id, f"bad_nok_{i}", productive=0)
+            insert_git_heads(carry_db, f"bad_nok_{i}", "/bad/proj", f"head_{i}")
+
+        result = patched_env.calibrate_project_thresholds("/bad/proj", dry_run=True)
+        # Should tighten (suggest lower limits)
+        assert any(c["new"] < c["old"] for c in result["changes"])
+
+    def test_unknown_type_no_data_no_error(self, carry_db, patched_env, tmp_path):
+        """Unknown project type with no outcomes should not error."""
+        (tmp_path / ".git").mkdir()
+        result = patched_env.calibrate_project_thresholds(str(tmp_path), dry_run=True)
+        assert result["project_type"] is None
+        assert result["changes"] == []
+
+    def test_fewer_than_5_seeds_from_type(self, carry_db, patched_env, tmp_path):
+        """Fewer than 5 outcomes -> should seed from type defaults."""
+        (tmp_path / "Cargo.toml").write_text("[package]\nname = 't'\n")
+        (tmp_path / ".git").mkdir()
+
+        # Only 2 outcomes for this project
+        for i in range(2):
+            dec_id = insert_decision(carry_db, f"few_{i}", "continue", True)
+            insert_outcome(carry_db, dec_id, f"few_{i}", productive=1)
+            insert_git_heads(carry_db, f"few_{i}", str(tmp_path), f"head_{i}")
+
+        result = patched_env.calibrate_project_thresholds(str(tmp_path), dry_run=True)
+        assert "Seeded" in result["summary"]["message"] or result["changes"]
+
+
+class TestProjectThresholdsTable:
+    """Tests for the project_thresholds DB table."""
+
+    def test_table_created(self, carry_db, patched_env):
+        """project_thresholds table should exist after get_carry_conn."""
+        conn = sqlite3.connect(carry_db)
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='project_thresholds'"
+        ).fetchall()
+        conn.close()
+        assert len(rows) == 1
+
+    def test_upsert_behavior(self, carry_db, patched_env):
+        """Writing same (project_dir, key) twice should update, not duplicate."""
+        insert_project_threshold(carry_db, "/proj", "noop_limit", 5)
+        insert_project_threshold(carry_db, "/proj", "noop_limit", 7)
+
+        conn = sqlite3.connect(carry_db)
+        rows = conn.execute(
+            "SELECT value FROM project_thresholds WHERE project_dir = ? AND key = ?",
+            ("/proj", "noop_limit")
+        ).fetchall()
+        conn.close()
+        assert len(rows) == 1
+        assert rows[0][0] == "7"

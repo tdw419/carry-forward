@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Carry Forward v5.3 - self-tuning intelligence layer for Hermes session continuity.
+Carry Forward v5.4 - self-tuning intelligence layer for Hermes session continuity.
 Transport, not comprehension. Packages what happened; agents do the interpretation.
 v5: Decisions are logged, outcomes are tracked, thresholds are calibrated from data.
 
@@ -20,8 +20,8 @@ Usage:
     carry_forward.py record-git-heads SESSION_ID  # Snapshot git HEADs for thrash detection
     carry_forward.py learn                        # Analyze session history, record patterns
     carry_forward.py record-outcome [SESSION_ID]  # Record outcome of a past decision
-    carry_forward.py calibrate                    # Auto-tune thresholds from decision history
-    carry_forward.py show-config                  # Show current threshold values
+    carry_forward.py calibrate [--project DIR]       # Auto-tune thresholds (global or per-project)
+    carry_forward.py show-config [--project DIR]     # Show current threshold values
     carry_forward.py roadmap                      # Show roadmap progress for detected projects
 """
 import sqlite3
@@ -73,6 +73,39 @@ THRESHOLD_DEFS = {
     "noop_limit": {"default": NOOP_LIMIT, "type": int, "min": 2, "max": 10},
 }
 
+# Thresholds that are eligible for per-project overrides (stall/noop are the ones
+# that vary most by project type -- Rust's cargo test is slower than Python's pytest).
+PROJECT_OVERRIDABLE = {"stagnation_stall_limit", "noop_limit", "hallucination_loop_limit"}
+
+# ---------------------------------------------------------------------------
+# Project type detection
+# ---------------------------------------------------------------------------
+
+# Maps filenames to project type labels
+PROJECT_TYPE_MARKERS = {
+    "Cargo.toml": "rust",
+    "pyproject.toml": "python",
+    "setup.py": "python",
+    "setup.cfg": "python",
+    "package.json": "node",
+    "go.mod": "go",
+    "Makefile": "make",
+    "pom.xml": "java",
+    "build.gradle": "java",
+}
+
+# Default threshold multipliers by project type.
+# Rust builds are slower (compilation), so stall/noop limits should be higher.
+# Python cycles are fast, so defaults are fine.
+PROJECT_TYPE_DEFAULTS = {
+    "rust": {"stagnation_stall_limit": 5, "noop_limit": 4, "hallucination_loop_limit": 4},
+    "python": {},  # uses global defaults
+    "node": {"stagnation_stall_limit": 4, "noop_limit": 4},
+    "go": {"stagnation_stall_limit": 4, "noop_limit": 4},
+    "make": {"stagnation_stall_limit": 4, "noop_limit": 4},
+    "java": {"stagnation_stall_limit": 5, "noop_limit": 4, "hallucination_loop_limit": 4},
+}
+
 
 def _read_config(key: str) -> Optional[str]:
     """Read a config value from the carry_forward DB. Returns None if not set."""
@@ -114,6 +147,135 @@ def get_all_thresholds() -> Dict[str, Any]:
         else:
             result[key] = defn["default"]
     return result
+
+
+# ---------------------------------------------------------------------------
+# Project type detection & per-project thresholds (Phase 7)
+# ---------------------------------------------------------------------------
+
+def detect_project_type(project_dir: str) -> Optional[str]:
+    """Detect the project type by looking for marker files.
+
+    Walks up from project_dir to find the git root, then checks for
+    known marker files. Returns a type string like 'rust', 'python', etc.
+    """
+    # Find the actual project root (git root or the dir itself)
+    check_dir = project_dir
+    while check_dir and check_dir != "/":
+        if os.path.isdir(os.path.join(check_dir, ".git")):
+            break
+        parent = os.path.dirname(check_dir)
+        if parent == check_dir:
+            break
+        check_dir = parent
+
+    if not os.path.isdir(check_dir):
+        return None
+
+    # Check for marker files (order matters -- first match wins)
+    for marker, ptype in PROJECT_TYPE_MARKERS.items():
+        if os.path.isfile(os.path.join(check_dir, marker)):
+            return ptype
+
+    return None
+
+
+def _read_project_config(project_dir: str, key: str) -> Optional[str]:
+    """Read a project-specific threshold value from the project_thresholds table."""
+    conn = get_carry_conn()
+    row = conn.execute(
+        "SELECT value FROM project_thresholds WHERE project_dir = ? AND key = ?",
+        (project_dir, key)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def _write_project_config(project_dir: str, key: str, value: str,
+                          source: str = "calibration") -> None:
+    """Write a project-specific threshold value."""
+    conn = get_carry_conn()
+    conn.execute(
+        """INSERT OR REPLACE INTO project_thresholds
+           (project_dir, key, value, source, project_type, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (project_dir, key, value, source, detect_project_type(project_dir) or "unknown", time.time())
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_threshold_for_project(key: str, project_dir: Optional[str] = None) -> Any:
+    """Get a threshold value with project-specific overrides.
+
+    Resolution order:
+    1. project_thresholds table (explicit per-project override)
+    2. PROJECT_TYPE_DEFAULTS (defaults for this project type, auto-detected)
+    3. config table (global override)
+    4. THRESHOLD_DEFS default constant
+
+    Only keys in PROJECT_OVERRIDABLE are eligible for per-project overrides.
+    """
+    if key not in THRESHOLD_DEFS:
+        raise ValueError(f"Unknown threshold: {key}")
+
+    defn = THRESHOLD_DEFS[key]
+
+    # Step 1: Check explicit per-project override
+    if project_dir and key in PROJECT_OVERRIDABLE:
+        val_str = _read_project_config(project_dir, key)
+        if val_str is not None:
+            return defn["type"](val_str)
+
+    # Step 2: Check project type defaults (only for overridable keys)
+    if project_dir and key in PROJECT_OVERRIDABLE:
+        ptype = detect_project_type(project_dir)
+        if ptype and ptype in PROJECT_TYPE_DEFAULTS:
+            type_defaults = PROJECT_TYPE_DEFAULTS[ptype]
+            if key in type_defaults:
+                return type_defaults[key]
+
+    # Step 3: Fall back to global config / default
+    return get_threshold(key)
+
+
+def get_all_thresholds_for_project(project_dir: Optional[str] = None) -> Dict[str, Any]:
+    """Return all threshold values with project-specific overrides applied."""
+    result = {}
+    for key in THRESHOLD_DEFS:
+        result[key] = get_threshold_for_project(key, project_dir)
+    return result
+
+
+def _resolve_project_dir(session_id: Optional[str]) -> Optional[str]:
+    """Resolve the primary project directory for a session.
+
+    Checks chain_meta.project_dir first, then falls back to the
+    most common project_dir in chain_git_heads for this session.
+    """
+    carry_conn = get_carry_conn()
+
+    # Try chain_meta first
+    if session_id:
+        row = carry_conn.execute(
+            "SELECT project_dir FROM chain_meta WHERE session_id = ? AND project_dir IS NOT NULL",
+            (session_id,)
+        ).fetchone()
+        if row and row[0]:
+            carry_conn.close()
+            return row[0]
+
+        # Fall back to chain_git_heads -- pick the most recent entry
+        row = carry_conn.execute(
+            "SELECT project_dir FROM chain_git_heads WHERE session_id = ? ORDER BY recorded_at DESC LIMIT 1",
+            (session_id,)
+        ).fetchone()
+        if row and row[0]:
+            carry_conn.close()
+            return row[0]
+
+    carry_conn.close()
+    return None
 
 
 def _get_chain_stalls(session_id: str) -> int:
@@ -587,6 +749,18 @@ def get_carry_conn() -> sqlite3.Connection:
             created_at REAL NOT NULL
         )
     """)
+    # v7: Project-specific thresholds -- per-project overrides for stall/noop limits
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS project_thresholds (
+            project_dir TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'auto-detect',
+            project_type TEXT,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (project_dir, key)
+        )
+    """)
     conn.commit()
     return conn
 
@@ -987,6 +1161,9 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
             own_msgs = early_row[1]
     conn_early.close()
 
+    # Phase 7: Resolve project directory for project-aware thresholds
+    project_dir = _resolve_project_dir(resolved_session_id)
+
     # Check 1: Dead session thrash (chain has too many dead sessions)
     # But don't halt if the current session is already active -- a productive
     # session shouldn't be killed because its ancestors were dead.
@@ -1056,14 +1233,16 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
     # Check 7: Stagnation circuit breaker (v7)
     # Count consecutive ticks with no commits across the chain. If >= limit, hard halt.
     # Active session override: if this session has tool calls, don't halt (might be mid-commit).
+    # Phase 7: Uses project-aware stagnation_stall_limit.
     stagnation_halt = False
     consecutive_stalls = _get_chain_stalls(resolved_session_id or "")
-    if git_stalled and consecutive_stalls >= get_threshold("stagnation_stall_limit") and own_tools == 0:
+    stag_limit = get_threshold_for_project("stagnation_stall_limit", project_dir)
+    if git_stalled and consecutive_stalls >= stag_limit and own_tools == 0:
         stagnation_halt = True
         reasons.append(
             f"Stagnation: {consecutive_stalls} consecutive ticks with no commits"
         )
-    elif git_stalled and consecutive_stalls >= get_threshold("stagnation_stall_limit"):
+    elif git_stalled and consecutive_stalls >= stag_limit:
         guard_rails.append(
             f"Stagnation detected ({consecutive_stalls} stalls) but session is active"
         )
@@ -1073,15 +1252,17 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
     # Check 8: Hallucination loop detection (v7)
     # If the same files are being edited across multiple ticks with no commits,
     # the agent is stuck in a loop. Hard halt if limit reached, guard rail if 2 ticks.
+    # Phase 7: Uses project-aware hallucination_loop_limit.
     hallucination_halt = False
     hallucination_files = []
+    hlimit = get_threshold_for_project("hallucination_loop_limit", project_dir)
     if resolved_session_id:
         h_loop, h_files, h_details = _detect_hallucination_loop(resolved_session_id)
         if h_loop and own_tools == 0:
             hallucination_halt = True
             hallucination_files = h_files
             reasons.append(
-                f"Hallucination loop: same {len(h_files)} file(s) in {get_threshold('hallucination_loop_limit')}+ ticks "
+                f"Hallucination loop: same {len(h_files)} file(s) in {hlimit}+ ticks "
                 f"with no commit ({', '.join(h_files[:3])})"
             )
         elif h_loop:
@@ -1111,8 +1292,9 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
     # Check 10: Consecutive no-op counter (v7)
     # Unified metric: no commit AND no test increase = no-op.
     # Hard halt after noop_limit consecutive no-ops with no active tools.
+    # Phase 7: Uses project-aware noop_limit.
     noop_halt = False
-    noop_limit = get_threshold("noop_limit")
+    noop_limit = get_threshold_for_project("noop_limit", project_dir)
     consecutive_noops = _count_consecutive_noops(resolved_session_id or "")
     is_noop = (git_stalled and not test_regression_halt)  # no commit and no test crash
     _update_noop_counter(resolved_session_id or "", is_noop)
@@ -1207,6 +1389,7 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
         "noop_halt": noop_halt,
         "consecutive_noops": consecutive_noops,
         "roadmap_signal": roadmap_signal,
+        "project_dir": project_dir,
     }
 
 
@@ -1781,21 +1964,210 @@ def cmd_calibrate(dry_run: bool = False) -> None:
         print("\nNo threshold changes needed.")
 
 
-def cmd_show_config() -> None:
-    """Show all current threshold values and their source."""
-    print("=== Carry Forward Thresholds ===\n")
-    for key, defn in THRESHOLD_DEFS.items():
-        val_str = _read_config(key)
-        if val_str is not None:
-            source_row = None
-            conn = get_carry_conn()
-            row = conn.execute("SELECT source, updated_at FROM config WHERE key = ?", (key,)).fetchone()
-            conn.close()
-            source = row[0] if row else "unknown"
-            ts = datetime.fromtimestamp(row[1]).strftime("%Y-%m-%d %H:%M") if row and row[1] else "?"
-            print(f"  {key} = {val_str}  (source: {source}, since {ts})")
-        else:
-            print(f"  {key} = {defn['default']}  (source: default)")
+def cmd_show_config(project_dir: Optional[str] = None) -> None:
+    """Show all current threshold values and their source.
+
+    If project_dir is given, show the effective thresholds for that project
+    (including per-project overrides and type defaults).
+    """
+    if project_dir:
+        ptype = detect_project_type(project_dir)
+        print(f"=== Carry Forward Thresholds (project: {project_dir}) ===")
+        if ptype:
+            print(f"  Detected type: {ptype}")
+        print()
+        for key, defn in THRESHOLD_DEFS.items():
+            effective = get_threshold_for_project(key, project_dir)
+            global_val = get_threshold(key)
+            if effective != global_val:
+                print(f"  {key} = {effective}  (project override, global={global_val})")
+            elif global_val != defn["default"]:
+                print(f"  {key} = {effective}  (global override, default={defn['default']})")
+            else:
+                print(f"  {key} = {effective}  (default)")
+    else:
+        print("=== Carry Forward Thresholds ===\n")
+        for key, defn in THRESHOLD_DEFS.items():
+            val_str = _read_config(key)
+            if val_str is not None:
+                source_row = None
+                conn = get_carry_conn()
+                row = conn.execute("SELECT source, updated_at FROM config WHERE key = ?", (key,)).fetchone()
+                conn.close()
+                source = row[0] if row else "unknown"
+                ts = datetime.fromtimestamp(row[1]).strftime("%Y-%m-%d %H:%M") if row and row[1] else "?"
+                print(f"  {key} = {val_str}  (source: {source}, since {ts})")
+            else:
+                print(f"  {key} = {defn['default']}  (source: default)")
+
+    # Show project-specific overrides
+    carry_conn = get_carry_conn()
+    try:
+        proj_rows = carry_conn.execute("""
+            SELECT project_dir, key, value, source, project_type, updated_at
+            FROM project_thresholds
+            ORDER BY project_dir, key
+        """).fetchall()
+    except sqlite3.OperationalError:
+        proj_rows = []
+    carry_conn.close()
+
+    if proj_rows:
+        print("\n=== Project-Specific Thresholds ===\n")
+        current_proj = None
+        for pdir, pkey, pval, psrc, pttype, pts in proj_rows:
+            if pdir != current_proj:
+                current_proj = pdir
+                print(f"  [{pdir}] (type: {pttype or 'unknown'})")
+            ts_str = datetime.fromtimestamp(pts).strftime("%Y-%m-%d %H:%M") if pts else "?"
+            print(f"    {pkey} = {pval}  (source: {psrc}, since {ts_str})")
+
+
+# ---------------------------------------------------------------------------
+# Phase 7: Per-project calibration from outcome data
+# ---------------------------------------------------------------------------
+
+def calibrate_project_thresholds(project_dir: str, dry_run: bool = False) -> Dict[str, Any]:
+    """Calibrate thresholds for a specific project based on its outcome data.
+
+    Uses the same calibration logic as calibrate_thresholds() but scoped to
+    decisions that involved this project (matched via chain_git_heads.project_dir).
+
+    If there are fewer than 5 outcomes for this project, seeds from
+    PROJECT_TYPE_DEFAULTS instead.
+    """
+    ptype = detect_project_type(project_dir)
+    carry_conn = get_carry_conn()
+
+    # Find decision sessions that involved this project
+    project_sessions = carry_conn.execute("""
+        SELECT DISTINCT session_id FROM chain_git_heads WHERE project_dir = ?
+    """, (project_dir,)).fetchall()
+    project_session_ids = [r[0] for r in project_sessions]
+
+    if not project_session_ids:
+        carry_conn.close()
+        # Seed from project type defaults
+        return _seed_project_type_defaults(project_dir, ptype, dry_run)
+
+    # Gather outcomes scoped to this project's sessions
+    placeholders = ",".join("?" * len(project_session_ids))
+    rows = carry_conn.execute(f"""
+        SELECT dl.decision, dl.can_continue,
+               do_out.outcome_productive, do_out.outcome_git_moved,
+               do_out.outcome_chain_continued, do_out.outcome_tool_calls
+        FROM decision_outcomes do_out
+        JOIN decision_log dl ON do_out.decision_id = dl.id
+        WHERE do_out.session_id IN ({placeholders})
+        ORDER BY do_out.checked_at DESC
+        LIMIT 100
+    """, project_session_ids).fetchall()
+    carry_conn.close()
+
+    if len(rows) < 5:
+        # Not enough data -- seed from project type defaults
+        return _seed_project_type_defaults(project_dir, ptype, dry_run)
+
+    # Same calibration logic as global, but writes to project_thresholds
+    continue_outcomes = [(r[2], r[3], r[4], r[5]) for r in rows if r[1] == 1]
+    halt_outcomes = [(r[2], r[3], r[4], r[5]) for r in rows if r[1] == 0]
+
+    continue_productive = sum(1 for o in continue_outcomes if o[0])
+    continue_count = len(continue_outcomes)
+    halt_unproductive = sum(1 for o in halt_outcomes if not o[0])
+    halt_count = len(halt_outcomes)
+
+    changes = []
+
+    def _adjust_project(key: str, delta: int, reason: str) -> None:
+        current = get_threshold_for_project(key, project_dir)
+        defn = THRESHOLD_DEFS[key]
+        new_val = current + delta
+        new_val = max(defn["min"], min(defn["max"], new_val))
+        if new_val != current:
+            if not dry_run:
+                _write_project_config(project_dir, key, str(new_val), "project_calibration")
+            changes.append({
+                "key": key,
+                "old": current,
+                "new": new_val,
+                "reason": reason,
+            })
+
+    # Continue decision accuracy
+    if continue_count >= 3:
+        productive_rate = continue_productive / continue_count
+        if productive_rate > 0.8:
+            _adjust_project("stagnation_stall_limit", 1,
+                            f"project continue accuracy {productive_rate:.0%} (>{0.8:.0%}), loosening")
+            _adjust_project("noop_limit", 1,
+                            f"project continue accuracy {productive_rate:.0%} (>{0.8:.0%}), loosening")
+        elif productive_rate < 0.5:
+            _adjust_project("stagnation_stall_limit", -1,
+                            f"project continue accuracy {productive_rate:.0%} (<{0.5:.0%}), tightening")
+            _adjust_project("noop_limit", -1,
+                            f"project continue accuracy {productive_rate:.0%} (<{0.5:.0%}), tightening")
+            _adjust_project("hallucination_loop_limit", -1,
+                            f"project continue accuracy {productive_rate:.0%} (<{0.5:.0%}), tightening")
+
+    # Halt decision accuracy
+    if halt_count >= 3:
+        halt_correct_rate = halt_unproductive / halt_count
+        if halt_correct_rate > 0.8:
+            _adjust_project("stagnation_stall_limit", -1,
+                            f"project halt accuracy {halt_correct_rate:.0%} (>{0.8:.0%}), tightening")
+        elif halt_correct_rate < 0.5:
+            _adjust_project("stagnation_stall_limit", 1,
+                            f"project halt accuracy {halt_correct_rate:.0%} (<{0.5:.0%}), loosening")
+            _adjust_project("noop_limit", 1,
+                            f"project halt accuracy {halt_correct_rate:.0%} (<{0.5:.0%}), loosening")
+
+    return {
+        "project_dir": project_dir,
+        "project_type": ptype,
+        "changes": changes,
+        "summary": {
+            "outcome_count": len(rows),
+            "continue_count": continue_count,
+            "continue_productive_rate": f"{continue_productive / continue_count:.0%}" if continue_count else "N/A",
+            "halt_count": halt_count,
+            "halt_correct_rate": f"{halt_unproductive / halt_count:.0%}" if halt_count else "N/A",
+        }
+    }
+
+
+def _seed_project_type_defaults(project_dir: str, ptype: Optional[str],
+                                dry_run: bool = False) -> Dict[str, Any]:
+    """Seed per-project thresholds from PROJECT_TYPE_DEFAULTS for a new project."""
+    if not ptype or ptype not in PROJECT_TYPE_DEFAULTS:
+        return {
+            "project_dir": project_dir,
+            "project_type": ptype,
+            "changes": [],
+            "summary": {"message": f"No type defaults for '{ptype}' -- using global thresholds"}
+        }
+
+    changes = []
+    type_defaults = PROJECT_TYPE_DEFAULTS[ptype]
+
+    for key, value in type_defaults.items():
+        current = get_threshold(key)  # global value
+        if value != current:
+            if not dry_run:
+                _write_project_config(project_dir, key, str(value), "auto-detect")
+            changes.append({
+                "key": key,
+                "old": current,
+                "new": value,
+                "reason": f"seeded from {ptype} type defaults",
+            })
+
+    return {
+        "project_dir": project_dir,
+        "project_type": ptype,
+        "changes": changes,
+        "summary": {"message": f"Seeded {len(changes)} thresholds from {ptype} type defaults"}
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2667,10 +3039,33 @@ if __name__ == "__main__":
 
     elif cmd == "calibrate":
         dry_run = "--dry-run" in sys.argv
-        cmd_calibrate(dry_run)
+        project = None
+        if "--project" in sys.argv:
+            idx = sys.argv.index("--project")
+            if idx + 1 < len(sys.argv):
+                project = sys.argv[idx + 1]
+        if project:
+            result = calibrate_project_thresholds(project, dry_run=dry_run)
+            print(f"Project: {result.get('project_dir', project)}")
+            print(f"Type: {result.get('project_type', 'unknown')}")
+            if "message" in result.get("summary", {}):
+                print(result["summary"]["message"])
+            elif result.get("changes"):
+                print(f"\nThreshold changes ({'dry run' if dry_run else 'applied'}):")
+                for c in result["changes"]:
+                    print(f"  {c['key']}: {c['old']} -> {c['new']} ({c['reason']})")
+            else:
+                print("\nNo project threshold changes needed.")
+        else:
+            cmd_calibrate(dry_run)
 
     elif cmd == "show-config":
-        cmd_show_config()
+        project = None
+        if "--project" in sys.argv:
+            idx = sys.argv.index("--project")
+            if idx + 1 < len(sys.argv):
+                project = sys.argv[idx + 1]
+        cmd_show_config(project)
 
     elif cmd == "learn":
         cmd_learn()

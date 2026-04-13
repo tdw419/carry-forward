@@ -95,7 +95,17 @@ def _create_carry_db(path):
             evidence TEXT,
             hit_count INTEGER DEFAULT 1,
             last_hit REAL NOT NULL,
-            created_at REAL NOT NULL)""",
+            created_at REAL NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS project_thresholds (
+            project_dir TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'auto-detect',
+            project_type TEXT,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (project_dir, key)
+        )""",
     ]:
         conn.execute(ddl)
     conn.commit()
@@ -237,6 +247,17 @@ def insert_lesson(carry_db, lesson, category="general", evidence="", hit_count=1
     conn.execute(
         "INSERT INTO lessons (lesson, category, evidence, hit_count, last_hit, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         (lesson, category, evidence, hit_count, time.time(), time.time())
+    )
+    conn.commit()
+    conn.close()
+
+
+def insert_project_threshold(carry_db, project_dir, key, value, source="calibration", project_type=None):
+    """Insert a project-specific threshold override."""
+    conn = sqlite3.connect(carry_db)
+    conn.execute(
+        "INSERT OR REPLACE INTO project_thresholds (project_dir, key, value, source, project_type, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (project_dir, key, str(value), source, project_type, time.time())
     )
     conn.commit()
     conn.close()

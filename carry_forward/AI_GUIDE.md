@@ -72,6 +72,26 @@ Every 10 outcomes, thresholds are auto-calibrated:
 - High halt accuracy (>80% correctly caught) -> tighten dead session detection
 - Low halt accuracy (<50% correct) -> loosen limits (avoid false stops)
 
+## Project-Aware Thresholds (Phase 7)
+
+Different projects need different thresholds. A Rust project with `cargo test` takes longer per cycle than a Python project with `pytest`.
+
+Resolution order for each threshold:
+1. `project_thresholds` table -- explicit per-project override (from calibration or manual set)
+2. `PROJECT_TYPE_DEFAULTS` -- auto-detected from project type (Cargo.toml -> rust, etc.)
+3. `config` table -- global override
+4. `THRESHOLD_DEFS` constants -- hardcoded defaults
+
+Only `stagnation_stall_limit`, `noop_limit`, and `hallucination_loop_limit` are project-overridable. Other thresholds (dead_session_threshold, etc.) are always global.
+
+Project type detection: scans for marker files (Cargo.toml, pyproject.toml, package.json, etc.).
+
+Per-project calibration: `calibrate_project_thresholds()` uses the same logic as global calibration but scopes outcomes to sessions that involved a specific project (matched via `chain_git_heads.project_dir`). If fewer than 5 outcomes exist for a project, it seeds from `PROJECT_TYPE_DEFAULTS` instead.
+
+CLI:
+- `calibrate --project /path/to/project` -- calibrate thresholds for a specific project
+- `show-config --project /path/to/project` -- show effective thresholds for a project
+
 ## How to Add a New Guard Rail
 
 1. Write the detection function (e.g. `_detect_new_thing`)
