@@ -1753,3 +1753,231 @@ class TestContextIncludesTestCommand:
         output = capsys.readouterr().out
 
         assert "TEST:" not in output
+
+
+# ===========================================================================
+# Tests: session health dashboard (Phase 9)
+# ===========================================================================
+
+class TestSessionHealthData:
+    """Tests for session_health_data() -- the data-gathering backend."""
+
+    def test_empty_day(self, state_db, carry_db, patched_env):
+        """No sessions today should return all zeros."""
+        data = patched_env.session_health_data()
+        assert data["sessions_total"] == 0
+        assert data["sessions_active"] == 0
+        assert data["sessions_dead"] == 0
+        assert data["commits_landed"] == 0
+        assert data["wasted_minutes"] == 0.0
+
+    def test_active_sessions_counted(self, state_db, carry_db, patched_env):
+        """Active sessions (tool_call_count > 0) should be counted."""
+        insert_session(state_db, "active_1", msgs=10, tools=5)
+        insert_session(state_db, "active_2", msgs=20, tools=10)
+        data = patched_env.session_health_data()
+        assert data["sessions_total"] == 2
+        assert data["sessions_active"] == 2
+        assert data["sessions_dead"] == 0
+
+    def test_dead_sessions_excluded_from_active(self, state_db, carry_db, patched_env):
+        """Dead sessions (0 tools, non-cron) should show in dead count."""
+        insert_session(state_db, "active_1", msgs=10, tools=5)
+        insert_session(state_db, "dead_1", msgs=0, tools=0, source="cli")
+        data = patched_env.session_health_data()
+        assert data["sessions_total"] == 2
+        assert data["sessions_active"] == 1
+        assert data["sessions_dead"] == 1
+
+    def test_cron_sessions_not_counted_as_dead(self, state_db, carry_db, patched_env):
+        """Cron sessions with 0 tools should not count as dead."""
+        insert_session(state_db, "cron_1", msgs=0, tools=0, source="cron")
+        data = patched_env.session_health_data()
+        assert data["sessions_total"] == 1
+        assert data["sessions_active"] == 0
+        assert data["sessions_dead"] == 0  # cron excluded
+
+    def test_decision_counts(self, state_db, carry_db, patched_env):
+        """Decision continue/halt should be counted."""
+        insert_session(state_db, "s1", msgs=5, tools=2)
+        insert_decision(carry_db, "s1", "continue", True)
+        insert_decision(carry_db, "s1", "halt", False)
+        insert_decision(carry_db, "s1", "continue", True)
+        data = patched_env.session_health_data()
+        assert data["decisions_total"] == 3
+        assert data["decisions_continue"] == 2
+        assert data["decisions_halt"] == 1
+
+    def test_decision_skips_dash_project(self, state_db, carry_db, patched_env):
+        """Decision entries with --project session_id should be excluded."""
+        insert_session(state_db, "s1", msgs=5, tools=2)
+        insert_decision(carry_db, "s1", "continue", True)
+        insert_decision(carry_db, "--project", "halt", False)
+        data = patched_env.session_health_data()
+        assert data["decisions_total"] == 1  # only s1
+        assert data["decisions_continue"] == 1
+
+    def test_commits_landed_from_git_heads(self, state_db, carry_db, patched_env):
+        """Distinct new git HEADs today should count as commits."""
+        insert_git_heads(carry_db, "s1", "/proj/a", "abc123")
+        insert_git_heads(carry_db, "s1", "/proj/a", "def456")  # 2nd commit
+        data = patched_env.session_health_data()
+        assert data["commits_landed"] == 2  # both new, no prior HEAD
+
+    def test_commits_landed_excludes_prior_head(self, state_db, carry_db, patched_env):
+        """HEADs same as yesterday should not count as new commits."""
+        import time as _time
+        # Insert a "yesterday" HEAD
+        yesterday = _time.time() - 86400
+        conn = sqlite3.connect(carry_db)
+        conn.execute(
+            "INSERT INTO chain_git_heads (session_id, project_dir, git_head, recorded_at) VALUES (?, ?, ?, ?)",
+            ("old_s", "/proj/a", "abc123", yesterday)
+        )
+        conn.commit()
+        conn.close()
+        # Insert same HEAD today (no change)
+        insert_git_heads(carry_db, "s1", "/proj/a", "abc123")
+        data = patched_env.session_health_data()
+        assert data["commits_landed"] == 0  # same as before, no new commit
+
+    def test_commits_mixed_projects(self, state_db, carry_db, patched_env):
+        """Commits across multiple projects should be summed."""
+        insert_git_heads(carry_db, "s1", "/proj/a", "aaa111")
+        insert_git_heads(carry_db, "s1", "/proj/b", "bbb222")
+        data = patched_env.session_health_data()
+        assert data["commits_landed"] == 2
+
+    def test_test_counts_tracked(self, state_db, carry_db, patched_env):
+        """Latest test counts should be surfaced."""
+        insert_test_count(carry_db, "s1", 1, 163, "pytest")
+        insert_test_count(carry_db, "s1", 2, 165, "pytest")
+        data = patched_env.session_health_data()
+        assert "pytest" in data["test_counts"]
+        assert data["test_counts"]["pytest"] == 165  # latest
+
+    def test_wasted_time_with_duration(self, state_db, carry_db, patched_env):
+        """Dead sessions with ended_at should compute real duration."""
+        import time as _time
+        now = _time.time()
+        conn = sqlite3.connect(state_db)
+        # Add ended_at column if missing (test schema may not have it)
+        try:
+            conn.execute("ALTER TABLE sessions ADD COLUMN ended_at REAL")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute(
+            "INSERT INTO sessions (id, source, message_count, tool_call_count, started_at, ended_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("dead_timed", "cli", 0, 0, now - 300, now)  # 5 min session
+        )
+        conn.commit()
+        conn.close()
+        data = patched_env.session_health_data()
+        assert data["wasted_minutes"] >= 4.0  # roughly 5 min
+
+    def test_wasted_time_without_duration(self, state_db, carry_db, patched_env):
+        """Dead sessions without ended_at should estimate 60s each."""
+        insert_session(state_db, "dead_noend", msgs=0, tools=0, source="cli")
+        data = patched_env.session_health_data()
+        assert data["wasted_minutes"] >= 1.0  # 1 min estimate
+
+    def test_outcome_accuracy(self, state_db, carry_db, patched_env):
+        """Outcome productive/wasted counts should be accurate."""
+        insert_session(state_db, "s1", msgs=5, tools=2)
+        dec_id = insert_decision(carry_db, "s1", "continue", True)
+        insert_outcome(carry_db, dec_id, "s1", productive=1, tool_calls=5)
+        insert_outcome(carry_db, dec_id + 1, "s1", productive=0, tool_calls=0)
+        data = patched_env.session_health_data()
+        assert data["outcomes_total"] >= 2
+        assert data["outcomes_productive"] >= 1
+        assert data["outcomes_wasted"] >= 1
+
+    def test_outcome_skips_dash_project(self, state_db, carry_db, patched_env):
+        """Outcomes with --project session_id should be excluded from wasted."""
+        insert_session(state_db, "s1", msgs=5, tools=2)
+        insert_outcome(carry_db, 999, "--project", productive=0, tool_calls=0)
+        data = patched_env.session_health_data()
+        assert data["outcomes_wasted"] == 0  # --project excluded
+
+
+class TestCmdHealth:
+    """Tests for cmd_health() -- the CLI output formatter."""
+
+    def test_empty_day_output(self, state_db, carry_db, patched_env, capsys):
+        """Empty day should show NO DATA verdict."""
+        patched_env.cmd_health()
+        output = capsys.readouterr().out
+        assert "NO DATA" in output
+
+    def test_healthy_verdict(self, state_db, carry_db, patched_env, capsys):
+        """Active sessions + commits = HEALTHY."""
+        insert_session(state_db, "active_1", msgs=10, tools=5)
+        insert_session(state_db, "active_2", msgs=10, tools=5)
+        insert_git_heads(carry_db, "s1", "/proj/a", "newhead1")
+        patched_env.cmd_health()
+        output = capsys.readouterr().out
+        assert "HEALTHY" in output
+
+    def test_ok_verdict(self, state_db, carry_db, patched_env, capsys):
+        """40%+ active but no commits = OK."""
+        insert_session(state_db, "active_1", msgs=10, tools=5)
+        insert_session(state_db, "dead_1", msgs=0, tools=0, source="cli")
+        patched_env.cmd_health()
+        output = capsys.readouterr().out
+        assert "OK" in output
+
+    def test_stalled_verdict(self, state_db, carry_db, patched_env, capsys):
+        """All dead sessions = STALLED."""
+        insert_session(state_db, "dead_1", msgs=0, tools=0, source="cli")
+        patched_env.cmd_health()
+        output = capsys.readouterr().out
+        assert "STALLED" in output
+
+    def test_json_output(self, state_db, carry_db, patched_env, capsys):
+        """--json flag should produce valid JSON."""
+        insert_session(state_db, "active_1", msgs=10, tools=5)
+        patched_env.cmd_health(json_output=True)
+        output = capsys.readouterr().out
+        import json
+        data = json.loads(output)
+        assert data["sessions_total"] == 1
+        assert data["sessions_active"] == 1
+
+    def test_wasted_time_shown(self, state_db, carry_db, patched_env, capsys):
+        """Wasted time should appear in output when > 0."""
+        import time as _time
+        now = _time.time()
+        conn = sqlite3.connect(state_db)
+        try:
+            conn.execute("ALTER TABLE sessions ADD COLUMN ended_at REAL")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute(
+            "INSERT INTO sessions (id, source, message_count, tool_call_count, started_at, ended_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("dead_timed", "cli", 0, 0, now - 300, now)
+        )
+        conn.commit()
+        conn.close()
+        patched_env.cmd_health()
+        output = capsys.readouterr().out
+        assert "Time wasted" in output
+
+    def test_accuracy_shown(self, state_db, carry_db, patched_env, capsys):
+        """Accuracy should appear when there are outcomes."""
+        insert_session(state_db, "s1", msgs=5, tools=2)
+        dec_id = insert_decision(carry_db, "s1", "continue", True)
+        insert_outcome(carry_db, dec_id, "s1", productive=1, tool_calls=5)
+        patched_env.cmd_health()
+        output = capsys.readouterr().out
+        assert "Accuracy" in output
+
+    def test_session_counts_in_output(self, state_db, carry_db, patched_env, capsys):
+        """Session line should show total/active/dead."""
+        insert_session(state_db, "active_1", msgs=10, tools=5)
+        insert_session(state_db, "dead_1", msgs=0, tools=0, source="cli")
+        insert_session(state_db, "cron_1", msgs=0, tools=0, source="cron")
+        patched_env.cmd_health()
+        output = capsys.readouterr().out
+        assert "3 total" in output
+        assert "1 active" in output
+        assert "1 dead" in output

@@ -22,6 +22,7 @@ Usage:
     carry_forward.py record-outcome [SESSION_ID]  # Record outcome of a past decision
     carry_forward.py calibrate [--project DIR]       # Auto-tune thresholds (global or per-project)
     carry_forward.py show-config [--project DIR]     # Show current threshold values
+    carry_forward.py health [--json]                 # Session health dashboard for today
     carry_forward.py roadmap                      # Show roadmap progress for detected projects
 """
 import sqlite3
@@ -2788,6 +2789,273 @@ def cmd_context(include_cron: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Command: health (Phase 9: Session health dashboard)
+# ---------------------------------------------------------------------------
+
+def _today_bounds() -> Tuple[float, float]:
+    """Return (start_of_day, now) as unix timestamps for today in local time."""
+    now = time.time()
+    # Use datetime to get start of today in local time
+    local_now = datetime.fromtimestamp(now)
+    start_of_day = datetime(local_now.year, local_now.month, local_now.day).timestamp()
+    return start_of_day, now
+
+
+def _compute_git_commits_today(carry_conn) -> int:
+    """Count distinct git HEAD changes recorded today across all projects.
+
+    For each project, compare the HEAD recorded before today (if any) to the
+    HEADs recorded today. Each distinct new HEAD = 1 commit landed.
+    """
+    start_of_day, _ = _today_bounds()
+    cur = carry_conn.cursor()
+
+    # Get all git heads recorded today, grouped by project
+    cur.execute("""
+        SELECT project_dir, git_head FROM chain_git_heads
+        WHERE recorded_at >= ? AND recorded_at < ?
+    """, (start_of_day, start_of_day + 86400))
+    today_heads = cur.fetchall()
+
+    if not today_heads:
+        return 0
+
+    # Get the latest HEAD before today for each project
+    projects_today = set(h[0] for h in today_heads)
+    before_heads = {}
+    for proj in projects_today:
+        cur.execute("""
+            SELECT git_head FROM chain_git_heads
+            WHERE project_dir = ? AND recorded_at < ?
+            ORDER BY recorded_at DESC LIMIT 1
+        """, (proj, start_of_day))
+        row = cur.fetchone()
+        if row:
+            before_heads[proj] = row[0]
+
+    # Count distinct new HEADs per project
+    commits = 0
+    for proj in projects_today:
+        proj_heads = set(h[1] for h in today_heads if h[0] == proj)
+        before = before_heads.get(proj)
+        # All HEADs that differ from the pre-today HEAD count as new commits
+        if before:
+            commits += len(proj_heads - {before})
+        else:
+            commits += len(proj_heads)
+
+    return commits
+
+
+def _compute_wasted_time(state_conn) -> float:
+    """Estimate minutes wasted on failed (zero-tool, non-cron) sessions today.
+
+    A session with 0 tool calls that isn't a cron job is considered wasted.
+    Uses (ended_at - started_at) when available, otherwise estimates 60s.
+    """
+    start_of_day, now = _today_bounds()
+    cur = state_conn.cursor()
+
+    # Check if ended_at column exists (may not in older/test schemas)
+    has_ended_at = False
+    try:
+        cur.execute("SELECT ended_at FROM sessions LIMIT 0")
+        has_ended_at = True
+    except sqlite3.OperationalError:
+        pass
+
+    if has_ended_at:
+        cur.execute("""
+            SELECT started_at, ended_at FROM sessions
+            WHERE tool_call_count = 0
+              AND source NOT IN ('cron')
+              AND started_at >= ? AND started_at < ?
+        """, (start_of_day, start_of_day + 86400))
+    else:
+        cur.execute("""
+            SELECT started_at, NULL FROM sessions
+            WHERE tool_call_count = 0
+              AND source NOT IN ('cron')
+              AND started_at >= ? AND started_at < ?
+        """, (start_of_day, start_of_day + 86400))
+
+    wasted_secs = 0.0
+    for started, ended in cur.fetchall():
+        if ended and ended > started:
+            wasted_secs += (ended - started)
+        else:
+            wasted_secs += 60  # estimate 1 min for sessions without end time
+
+    return wasted_secs / 60.0  # return minutes
+
+
+def session_health_data() -> Dict[str, Any]:
+    """Gather today's session health metrics.
+
+    Returns dict with:
+        sessions_total: all sessions started today
+        sessions_active: sessions with tool_call_count > 0
+        sessions_dead: sessions with 0 tool calls (non-cron)
+        decisions_continue: decisions to continue today
+        decisions_halt: decisions to halt today
+        decisions_total: total decisions today
+        commits_landed: distinct git HEAD changes today
+        test_counts: dict of {project: latest_test_count} for today
+        wasted_minutes: estimated minutes on dead (non-cron) sessions
+        wasted_sessions: count of dead sessions
+    """
+    start_of_day, now = _today_bounds()
+    day_end = start_of_day + 86400
+
+    conn = get_conn()
+    carry = get_carry_conn()
+
+    # --- Session counts ---
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN tool_call_count > 0 THEN 1 ELSE 0 END) as active,
+            SUM(CASE WHEN tool_call_count = 0 AND source NOT IN ('cron') THEN 1 ELSE 0 END) as dead
+        FROM sessions
+        WHERE started_at >= ? AND started_at < ?
+    """, (start_of_day, day_end))
+    row = cur.fetchone()
+    sessions_total = row[0] or 0
+    sessions_active = int(row[1] or 0)
+    sessions_dead = int(row[2] or 0)
+
+    # --- Decision counts ---
+    ccur = carry.cursor()
+    ccur.execute("""
+        SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN can_continue = 1 THEN 1 ELSE 0 END) as continues,
+            SUM(CASE WHEN can_continue = 0 THEN 1 ELSE 0 END) as halts
+        FROM decision_log
+        WHERE created_at >= ? AND created_at < ?
+          AND session_id NOT LIKE '--%'
+    """, (start_of_day, day_end))
+    drow = ccur.fetchone()
+    decisions_total = drow[0] or 0
+    decisions_continue = int(drow[1] or 0)
+    decisions_halt = int(drow[2] or 0)
+
+    # --- Commits landed ---
+    commits_landed = _compute_git_commits_today(carry)
+
+    # --- Test counts (latest per session today) ---
+    ccur.execute("""
+        SELECT session_id, test_count, source FROM tick_test_counts
+        WHERE recorded_at >= ? AND recorded_at < ?
+        ORDER BY recorded_at DESC
+    """, (start_of_day, day_end))
+    test_entries = ccur.fetchall()
+    # Just track latest test counts we've seen
+    test_counts = {}
+    for sid, count, source in test_entries:
+        if source not in test_counts:
+            test_counts[source] = count
+
+    # --- Wasted time ---
+    wasted_minutes = _compute_wasted_time(conn)
+
+    # --- Decision accuracy (from outcomes) ---
+    ccur.execute("""
+        SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN outcome_productive = 1 THEN 1 ELSE 0 END) as productive,
+            SUM(CASE WHEN outcome_productive = 0 AND session_id NOT LIKE '--%' THEN 1 ELSE 0 END) as wasted
+        FROM decision_outcomes
+        WHERE checked_at >= ? AND checked_at < ?
+          AND session_id NOT LIKE '--%'
+    """, (start_of_day, day_end))
+    orow = ccur.fetchone()
+    outcomes_total = orow[0] or 0
+    outcomes_productive = int(orow[1] or 0)
+    outcomes_wasted = int(orow[2] or 0)
+
+    conn.close()
+    carry.close()
+
+    return {
+        "sessions_total": sessions_total,
+        "sessions_active": sessions_active,
+        "sessions_dead": sessions_dead,
+        "decisions_total": decisions_total,
+        "decisions_continue": decisions_continue,
+        "decisions_halt": decisions_halt,
+        "commits_landed": commits_landed,
+        "test_counts": test_counts,
+        "wasted_minutes": round(wasted_minutes, 1),
+        "wasted_sessions": sessions_dead,
+        "outcomes_total": outcomes_total,
+        "outcomes_productive": outcomes_productive,
+        "outcomes_wasted": outcomes_wasted,
+    }
+
+
+def cmd_health(json_output: bool = False) -> None:
+    """Print a session health dashboard for today.
+
+    One command to answer: "how's the loop doing?"
+    """
+    data = session_health_data()
+
+    if json_output:
+        print(json.dumps(data, indent=2))
+        return
+
+    # ASCII dashboard
+    total = data["sessions_total"]
+    active = data["sessions_active"]
+    dead = data["sessions_dead"]
+    pct_active = (active / total * 100) if total else 0
+
+    # Decision stats
+    d_total = data["decisions_total"]
+    d_cont = data["decisions_continue"]
+    d_halt = data["decisions_halt"]
+
+    # Outcome accuracy
+    o_total = data["outcomes_total"]
+    o_prod = data["outcomes_productive"]
+    o_waste = data["outcomes_wasted"]
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    print(f"=== SESSION HEALTH: {today_str} ===")
+    print()
+    print(f"  Sessions: {total} total | {active} active ({pct_active:.0f}%) | {dead} dead")
+    print(f"  Decisions: {d_total} total | {d_cont} continue | {d_halt} halt")
+    print(f"  Commits: {data['commits_landed']} landed")
+
+    if o_total:
+        acc = o_prod / o_total * 100
+        print(f"  Accuracy: {o_prod}/{o_total} productive ({acc:.0f}%) | {o_waste} wasted cycles")
+
+    if data["wasted_minutes"] > 0:
+        print(f"  Time wasted: {data['wasted_minutes']:.0f} min on {data['wasted_sessions']} dead sessions")
+
+    if data["test_counts"]:
+        parts = [f"{src}: {cnt}" for src, cnt in data["test_counts"].items()]
+        print(f"  Tests: {' | '.join(parts)}")
+
+    # Health verdict
+    print()
+    if total == 0:
+        print("  Verdict: NO DATA -- no sessions today")
+    elif pct_active >= 60 and data["commits_landed"] > 0:
+        print("  Verdict: HEALTHY -- active loop, commits landing")
+    elif pct_active >= 40:
+        print("  Verdict: OK -- some activity, check commits")
+    elif pct_active > 0:
+        print("  Verdict: SLOW -- mostly dead sessions")
+    else:
+        print("  Verdict: STALLED -- no active sessions")
+
+
+# ---------------------------------------------------------------------------
 # Command: roadmap
 # ---------------------------------------------------------------------------
 
@@ -3111,6 +3379,9 @@ if __name__ == "__main__":
         else:
             print("No test command detected for this project.")
             sys.exit(1)
+
+    elif cmd == "health":
+        cmd_health(json_output="--json" in sys.argv)
 
     elif cmd == "roadmap":
         sid = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else None

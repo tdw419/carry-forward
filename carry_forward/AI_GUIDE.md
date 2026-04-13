@@ -42,6 +42,7 @@ carry_forward.py record-git-heads SESSION_ID  # Snapshot git HEADs
 carry_forward.py learn                        # Analyze history, record patterns
 carry_forward.py record-outcome [SESSION_ID]  # Record decision outcome
 carry_forward.py calibrate                    # Auto-tune thresholds
+carry_forward.py health [--json]              # Session health dashboard for today
 carry_forward.py roadmap                      # Show project roadmap progress
 ```
 
@@ -114,6 +115,26 @@ Mapping (`TEST_COMMAND_MAP`):
 
 CLI: `carry_forward.py detect-test-command <project_dir>`
 
+## Session Health Dashboard (Phase 9)
+
+`session_health_data()` queries both state.db and carry_forward.db to produce a daily snapshot:
+
+- **Sessions today** -- total, active (tool_call_count > 0), dead (0 tools, non-cron)
+- **Decisions** -- continue vs halt counts from decision_log
+- **Commits landed** -- distinct new git HEADs in chain_git_heads today (excludes HEADs same as yesterday)
+- **Test counts** -- latest test count per source from tick_test_counts
+- **Time wasted** -- minutes spent on dead sessions (real duration when ended_at exists, 60s estimate otherwise)
+- **Outcome accuracy** -- productive vs wasted from decision_outcomes
+
+Verdict logic:
+- NO DATA: 0 sessions
+- HEALTHY: 60%+ active AND commits landing
+- OK: 40%+ active
+- SLOW: some activity but mostly dead
+- STALLED: no active sessions
+
+CLI: `carry_forward.py health [--json]`
+
 ## Dependencies
 
 - Core: Python stdlib only (sqlite3, subprocess, re, json, time)
@@ -123,7 +144,7 @@ CLI: `carry_forward.py detect-test-command <project_dir>`
 ## Test Command
 
 ```bash
-python3 -m pytest              # run all 163 tests
+python3 -m pytest              # run all 185 tests
 python3 -m pytest tests/test_carry_forward.py  # just core tests
 python3 replay_harness.py      # backtest against history
 ```
