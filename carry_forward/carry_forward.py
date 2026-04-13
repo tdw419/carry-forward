@@ -789,6 +789,17 @@ def get_carry_conn() -> sqlite3.Connection:
             PRIMARY KEY (project_dir, key)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS failure_fingerprints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            fingerprint_type TEXT NOT NULL,
+            file_path TEXT,
+            snippet TEXT,
+            project_dir TEXT,
+            created_at REAL NOT NULL
+        )
+    """)
     conn.commit()
     return conn
 
@@ -1604,6 +1615,13 @@ def record_outcome(session_id: Optional[str] = None) -> Dict[str, Any]:
     ))
     carry_conn.commit()
     carry_conn.close()
+
+    # Phase 12: fingerprint failures in unproductive sessions
+    if productive == 0 and tool_calls > 0:
+        try:
+            fingerprint_session(dec_session_id)
+        except Exception:
+            pass  # fingerprinting is best-effort
 
     return {
         "decision_id": decision_id,
@@ -2476,6 +2494,258 @@ def cmd_suggest_next(project_dir: Optional[str] = None) -> None:
         print()
 
 
+# ---------------------------------------------------------------------------
+# Phase 12: Failure fingerprinting
+# ---------------------------------------------------------------------------
+
+# Failure fingerprint patterns -- regexes matched against tool messages
+# from unproductive sessions to identify *what kind* of failure occurred.
+FINGERPRINT_PATTERNS = [
+    ("compilation_error", re.compile(
+        r"error\[E\d{4}\]|error: |cannot find |mismatched types|"
+        r"no method named|expected .+, found|unresolved import",
+        re.IGNORECASE
+    )),
+    ("test_failure", re.compile(
+        r"FAILED|test result:.*failed|assertion failed|panicked at|"
+        r"\d+ failed",
+        re.IGNORECASE
+    )),
+    ("timeout_kill", re.compile(
+        r"timed out|was killed|Timeout|SIGTERM|process terminated|"
+        r"deadline exceeded",
+        re.IGNORECASE
+    )),
+    ("build_error", re.compile(
+        r"cargo build failed|make: \*\*\*|npm ERR!|cmake error|"
+        r"build failed|compilation aborted",
+        re.IGNORECASE
+    )),
+    ("runtime_error", re.compile(
+        r"thread.*panicked|segmentation fault|stack overflow|"
+        r"index out of bounds|unwrap\(\) on a None|borrow checker|"
+        r"cannot borrow",
+        re.IGNORECASE
+    )),
+]
+
+# Regex to extract file paths from error messages
+_ERROR_PATH_PATTERN = re.compile(
+    r"/home/jericho/[a-zA-Z0-9_/.]+\.[a-z]{1,4}"
+)
+
+
+def extract_failure_fingerprints(session_id: str) -> List[Dict[str, Any]]:
+    """Extract failure fingerprints from an unproductive session's tool messages.
+
+    Scans tool messages for known error patterns and returns a list of
+    fingerprint dicts with keys:
+        fingerprint_type, file_path, snippet, session_id
+    """
+    conn = get_conn()
+
+    # Get tool messages for this session
+    tool_rows = conn.execute("""
+        SELECT content FROM messages
+        WHERE session_id = ? AND role = 'tool'
+    """, (session_id,)).fetchall()
+    conn.close()
+
+    if not tool_rows:
+        return []
+
+    fingerprints = []
+    seen = set()  # dedup by (type, snippet)
+
+    for (content,) in tool_rows:
+        text = content or ""
+        lines = text.split("\n")
+
+        for line in lines:
+            for fp_type, pattern in FINGERPRINT_PATTERNS:
+                if pattern.search(line):
+                    # Extract file path from the error line
+                    path_match = _ERROR_PATH_PATTERN.search(line)
+                    file_path = path_match.group(0) if path_match else None
+
+                    snippet = line.strip()[:200]
+                    dedup_key = (fp_type, snippet)
+                    if dedup_key not in seen:
+                        seen.add(dedup_key)
+                        fingerprints.append({
+                            "fingerprint_type": fp_type,
+                            "file_path": file_path,
+                            "snippet": snippet,
+                            "session_id": session_id,
+                        })
+
+                    break  # one match per line is enough
+
+    return fingerprints[:20]  # cap at 20 fingerprints per session
+
+
+def store_failure_fingerprints(fingerprints: List[Dict[str, Any]],
+                               project_dir: Optional[str] = None) -> int:
+    """Store extracted failure fingerprints in the DB.
+
+    Returns the number of fingerprints stored.
+    """
+    if not fingerprints:
+        return 0
+
+    now = time.time()
+    carry_conn = get_carry_conn()
+    stored = 0
+
+    for fp in fingerprints:
+        carry_conn.execute(
+            "INSERT INTO failure_fingerprints "
+            "(session_id, fingerprint_type, file_path, snippet, project_dir, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (fp["session_id"], fp["fingerprint_type"],
+             fp.get("file_path"), fp.get("snippet", "")[:200],
+             project_dir, now)
+        )
+        stored += 1
+
+    carry_conn.commit()
+    carry_conn.close()
+    return stored
+
+
+def get_top_failure_fingerprints(project_dir: Optional[str] = None,
+                                 n: int = 5) -> List[Dict[str, Any]]:
+    """Get the most common failure types from recent fingerprints.
+
+    Returns a summary of failure types with counts and example snippets,
+    ordered by frequency.
+    """
+    carry_conn = get_carry_conn()
+    try:
+        if project_dir:
+            rows = carry_conn.execute("""
+                SELECT fingerprint_type, COUNT(*) as cnt,
+                       GROUP_CONCAT(DISTINCT file_path) as files,
+                       MAX(snippet) as example,
+                       MAX(created_at) as last_seen
+                FROM failure_fingerprints
+                WHERE project_dir = ? OR project_dir IS NULL
+                GROUP BY fingerprint_type
+                ORDER BY cnt DESC, last_seen DESC
+                LIMIT ?
+            """, (project_dir, n)).fetchall()
+        else:
+            rows = carry_conn.execute("""
+                SELECT fingerprint_type, COUNT(*) as cnt,
+                       GROUP_CONCAT(DISTINCT file_path) as files,
+                       MAX(snippet) as example,
+                       MAX(created_at) as last_seen
+                FROM failure_fingerprints
+                GROUP BY fingerprint_type
+                ORDER BY cnt DESC, last_seen DESC
+                LIMIT ?
+            """, (n,)).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    carry_conn.close()
+
+    return [
+        {
+            "type": r[0],
+            "count": r[1],
+            "files": (r[2] or "").split(",")[:5] if r[2] else [],
+            "example": r[3],
+            "last_seen": r[4],
+        }
+        for r in rows
+    ]
+
+
+def analyze_session_failures(project_dir: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Analyze all unproductive sessions and extract/store failure fingerprints.
+
+    Scans decision_outcomes for unproductive sessions, extracts fingerprints
+    from each, and stores them. Returns all fingerprints found.
+    """
+    carry_conn = get_carry_conn()
+
+    # Get unproductive sessions with tool calls
+    unprod = carry_conn.execute("""
+        SELECT dl.session_id
+        FROM decision_outcomes do_out
+        JOIN decision_log dl ON do_out.decision_id = dl.id
+        WHERE do_out.outcome_productive = 0 AND do_out.outcome_tool_calls > 0
+        ORDER BY do_out.checked_at DESC
+        LIMIT 50
+    """).fetchall()
+    carry_conn.close()
+
+    all_fingerprints = []
+    for (session_id,) in unprod:
+        fps = extract_failure_fingerprints(session_id)
+        if fps:
+            # Determine project_dir from file paths in fingerprints
+            paths = [fp["file_path"] for fp in fps if fp.get("file_path")]
+            detected_dir = None
+            if paths and project_dir:
+                detected_dir = project_dir
+            elif paths:
+                # Extract common prefix as project dir
+                common = os.path.commonpath(paths) if len(paths) > 1 else paths[0].rsplit("/", 1)[0]
+                # Walk up to find git root
+                detected_dir = common
+
+            store_failure_fingerprints(fps, project_dir=detected_dir)
+            all_fingerprints.extend(fps)
+
+    return all_fingerprints
+
+
+def cmd_analyze_failures(project_dir: Optional[str] = None) -> None:
+    """CLI command: analyze and display failure fingerprints."""
+    # Run analysis
+    fingerprints = analyze_session_failures(project_dir)
+
+    if not fingerprints:
+        print("No failure fingerprints found -- no unproductive sessions with tool calls.")
+        return
+
+    # Get summary
+    summary = get_top_failure_fingerprints(project_dir, n=10)
+
+    print("=== FAILURE FINGERPRINTS ===\n")
+    for s in summary:
+        print(f"  {s['type']} ({s['count']} occurrences)")
+        if s.get("example"):
+            print(f"    Example: {s['example'][:150]}")
+        if s.get("files"):
+            unique_files = list(dict.fromkeys(s["files"]))[:5]
+            print(f"    Files: {', '.join(unique_files)}")
+        print()
+
+    total = sum(s["count"] for s in summary)
+    print(f"Total: {total} fingerprints across {len(summary)} failure types")
+
+
+def fingerprint_session(session_id: str) -> int:
+    """Extract and store failure fingerprints for a specific session.
+
+    Called from auto_record_outcomes when a session is marked unproductive.
+    Returns the number of fingerprints stored.
+    """
+    fps = extract_failure_fingerprints(session_id)
+    if not fps:
+        return 0
+
+    # Detect project from file paths
+    paths = [fp["file_path"] for fp in fps if fp.get("file_path")]
+    project_dir = None
+    if paths:
+        project_dir = os.path.commonpath(paths) if len(paths) > 1 else paths[0].rsplit("/", 1)[0]
+
+    return store_failure_fingerprints(fps, project_dir=project_dir)
+
+
 
 def calibrate_project_thresholds(project_dir: str, dry_run: bool = False) -> Dict[str, Any]:
     """Calibrate thresholds for a specific project based on its outcome data.
@@ -3229,6 +3499,20 @@ def cmd_context(include_cron: bool = False) -> None:
             print(f"  {i}. [{s['source']}] ({s['confidence']:.0%}) {s['description']}")
         print()
 
+    # v12: Failure fingerprints
+    fail_fps = get_top_failure_fingerprints(n=3)
+    if fail_fps:
+        print("=== FAILURE FINGERPRINTS ===")
+        for fp in fail_fps:
+            print(f"  {fp['type']} ({fp['count']}x)")
+            if fp.get("example"):
+                print(f"    {fp['example'][:150]}")
+            if fp.get("files"):
+                unique = list(dict.fromkeys(f for f in fp["files"] if f))[:3]
+                if unique:
+                    print(f"    Files: {', '.join(unique)}")
+        print()
+
 
 # ---------------------------------------------------------------------------
 # Command: health (Phase 9: Session health dashboard)
@@ -3702,6 +3986,7 @@ def get_context_data(session_id: Optional[str] = None, include_cron: bool = Fals
         "learned_lessons": get_top_lessons(n=3),
         "technical_patterns": get_top_technical_patterns(n=3),
         "suggested_next": suggest_next(),
+        "failure_fingerprints": get_top_failure_fingerprints(n=3),
     }
 
 
@@ -3846,6 +4131,12 @@ if __name__ == "__main__":
         if len(sys.argv) > 2 and not sys.argv[2].startswith("--"):
             project = sys.argv[2]
         cmd_suggest_next(project)
+
+    elif cmd == "analyze-failures":
+        project = None
+        if len(sys.argv) > 2 and not sys.argv[2].startswith("--"):
+            project = sys.argv[2]
+        cmd_analyze_failures(project)
 
     else:
         print(f"Unknown command: {cmd}")

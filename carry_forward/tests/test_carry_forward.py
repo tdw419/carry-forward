@@ -2327,8 +2327,177 @@ class TestSuggestNext:
             dec_id = insert_decision(carry_db, f"hot_{i}", "continue", True)
             insert_outcome(carry_db, dec_id, f"hot_{i}", productive=0, tool_calls=5)
 
-        # Now these are the "recent" sessions with tools -- they should trigger
-        # last_session signal, so fallback may not trigger. The test verifies
         # that suggest_next returns *something* when there's data.
         result = patched_env.suggest_next()
         assert len(result) >= 1
+
+
+# ===========================================================================
+# Tests: Phase 12 -- Failure fingerprinting
+# ===========================================================================
+
+class TestFailureFingerprinting:
+    """Tests for Phase 12: failure fingerprint extraction and analysis."""
+
+    def _setup_unproductive_session(self, state_db, carry_db, sid, tool_messages):
+        """Helper: create an unproductive session with specific tool output."""
+        insert_session(state_db, sid, msgs=10, tools=5)
+        for msg in tool_messages:
+            insert_messages(state_db, sid, "tool", msg)
+        # Create decision + unproductive outcome
+        dec_id = insert_decision(carry_db, sid, "continue", True)
+        insert_outcome(carry_db, dec_id, sid, productive=0, tool_calls=5)
+
+    def test_extract_compilation_error(self, state_db, carry_db, patched_env):
+        """Should detect compilation errors in tool output."""
+        self._setup_unproductive_session(state_db, carry_db, "fail_1", [
+            "error[E0425]: cannot find value `x` in this scope\n"
+            "  --> /home/jericho/proj/src/main.rs:42:5",
+        ])
+        fps = patched_env.extract_failure_fingerprints("fail_1")
+        assert len(fps) >= 1
+        assert any(fp["fingerprint_type"] == "compilation_error" for fp in fps)
+
+    def test_extract_test_failure(self, state_db, carry_db, patched_env):
+        """Should detect test failures in tool output."""
+        self._setup_unproductive_session(state_db, carry_db, "fail_2", [
+            "running 10 tests\n"
+            "test test_vm_run ... FAILED\n"
+            "test test_parser ... ok\n"
+            "test result: failed. 1 passed; 1 failed;",
+        ])
+        fps = patched_env.extract_failure_fingerprints("fail_2")
+        assert len(fps) >= 1
+        assert any(fp["fingerprint_type"] == "test_failure" for fp in fps)
+
+    def test_extract_timeout(self, state_db, carry_db, patched_env):
+        """Should detect timeout kills in tool output."""
+        self._setup_unproductive_session(state_db, carry_db, "fail_3", [
+            "Process timed out after 300 seconds\n"
+            "cargo test was killed",
+        ])
+        fps = patched_env.extract_failure_fingerprints("fail_3")
+        assert len(fps) >= 1
+        assert any(fp["fingerprint_type"] == "timeout_kill" for fp in fps)
+
+    def test_extract_build_error(self, state_db, carry_db, patched_env):
+        """Should detect build errors in tool output."""
+        self._setup_unproductive_session(state_db, carry_db, "fail_4", [
+            "cargo build failed\n"
+            "make: *** [Makefile:42] Error 1",
+        ])
+        fps = patched_env.extract_failure_fingerprints("fail_4")
+        assert len(fps) >= 1
+        assert any(fp["fingerprint_type"] == "build_error" for fp in fps)
+
+    def test_extract_runtime_error(self, state_db, carry_db, patched_env):
+        """Should detect runtime errors in tool output."""
+        self._setup_unproductive_session(state_db, carry_db, "fail_5", [
+            "segmentation fault in /home/jericho/proj/src/main.rs",
+        ])
+        fps = patched_env.extract_failure_fingerprints("fail_5")
+        assert len(fps) >= 1
+        assert any(fp["fingerprint_type"] == "runtime_error" for fp in fps)
+
+    def test_no_tool_messages_returns_empty(self, state_db, carry_db, patched_env):
+        """Sessions with no tool messages should return empty."""
+        insert_session(state_db, "empty_1", msgs=2, tools=0)
+        fps = patched_env.extract_failure_fingerprints("empty_1")
+        assert fps == []
+
+    def test_file_path_extraction(self, state_db, carry_db, patched_env):
+        """Should extract file paths from error lines."""
+        self._setup_unproductive_session(state_db, carry_db, "fail_6", [
+            "error[E0425]: cannot find value `x` in /home/jericho/proj/src/vm.rs",
+        ])
+        fps = patched_env.extract_failure_fingerprints("fail_6")
+        paths_fps = [fp for fp in fps if fp.get("file_path")]
+        assert len(paths_fps) >= 1
+        assert any("vm.rs" in fp["file_path"] for fp in paths_fps)
+
+    def test_store_failure_fingerprints(self, state_db, carry_db, patched_env):
+        """Should store fingerprints in the DB."""
+        self._setup_unproductive_session(state_db, carry_db, "fail_7", [
+            "error[E0425]: cannot find value `x` in /home/jericho/proj/src/main.rs",
+        ])
+        fps = patched_env.extract_failure_fingerprints("fail_7")
+        stored = patched_env.store_failure_fingerprints(fps, project_dir="/home/jericho/proj")
+        assert stored >= 1
+
+        # Verify they're in the DB
+        import sqlite3
+        conn = sqlite3.connect(carry_db)
+        rows = conn.execute("SELECT * FROM failure_fingerprints").fetchall()
+        conn.close()
+        assert len(rows) >= 1
+
+    def test_get_top_failure_fingerprints(self, state_db, carry_db, patched_env):
+        """Should return summary of failure types by frequency."""
+        import sqlite3
+        conn = sqlite3.connect(carry_db)
+        now = time.time()
+        # Insert some fingerprints
+        for i in range(3):
+            conn.execute(
+                "INSERT INTO failure_fingerprints (session_id, fingerprint_type, file_path, snippet, project_dir, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (f"s{i}", "compilation_error", "/home/jericho/proj/src/main.rs", "error[E0425]", None, now)
+            )
+        for i in range(2):
+            conn.execute(
+                "INSERT INTO failure_fingerprints (session_id, fingerprint_type, file_path, snippet, project_dir, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (f"s{i+10}", "test_failure", None, "FAILED", None, now)
+            )
+        conn.commit()
+        conn.close()
+
+        result = patched_env.get_top_failure_fingerprints(n=5)
+        assert len(result) >= 2
+        assert result[0]["type"] == "compilation_error"  # most frequent
+        assert result[0]["count"] == 3
+
+    def test_get_top_failure_fingerprints_empty(self, state_db, carry_db, patched_env):
+        """Should return empty when no fingerprints exist."""
+        result = patched_env.get_top_failure_fingerprints()
+        assert result == []
+
+    def test_cmd_analyze_failures_output(self, state_db, carry_db, patched_env, capsys):
+        """CLI command should print failure info."""
+        self._setup_unproductive_session(state_db, carry_db, "fail_8", [
+            "error[E0425]: cannot find value `x` in /home/jericho/proj/src/main.rs",
+        ])
+        patched_env.cmd_analyze_failures()
+        output = capsys.readouterr().out
+        assert "FAILURE FINGERPRINTS" in output or "No failure fingerprints" in output
+
+    def test_fingerprint_session_helper(self, state_db, carry_db, patched_env):
+        """fingerprint_session should extract and store in one call."""
+        self._setup_unproductive_session(state_db, carry_db, "fail_9", [
+            "error: mismatched types in /home/jericho/proj/src/lib.rs",
+        ])
+        count = patched_env.fingerprint_session("fail_9")
+        assert count >= 1
+
+        import sqlite3
+        conn = sqlite3.connect(carry_db)
+        rows = conn.execute("SELECT * FROM failure_fingerprints").fetchall()
+        conn.close()
+        assert len(rows) >= 1
+
+    def test_deduplication(self, state_db, carry_db, patched_env):
+        """Duplicate error lines should be deduplicated."""
+        self._setup_unproductive_session(state_db, carry_db, "fail_10", [
+            "error: something went wrong\nerror: something went wrong\nerror: something went wrong",
+        ])
+        fps = patched_env.extract_failure_fingerprints("fail_10")
+        seen = set()
+        for fp in fps:
+            key = (fp["fingerprint_type"], fp["snippet"])
+            assert key not in seen, f"Duplicate fingerprint: {key}"
+            seen.add(key)
+
+    def test_max_twenty_fingerprints(self, state_db, carry_db, patched_env):
+        """Should cap at 20 fingerprints per session."""
+        msgs = [f"error[E{i:04d}]: different error number {i}" for i in range(30)]
+        self._setup_unproductive_session(state_db, carry_db, "fail_11", msgs)
+        fps = patched_env.extract_failure_fingerprints("fail_11")
+        assert len(fps) <= 20

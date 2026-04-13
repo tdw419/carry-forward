@@ -2,7 +2,7 @@
 
 **Purpose:** Carry Forward is the decision engine that keeps Hermes autonomous loops productive. It answers one question: "should we spawn another session?" It's not an orchestrator, not a task manager -- it's a governor.
 
-**Current state:** v5.8.0, 3840+ lines, 195 tests, 11 guard rail phases built. Powering the generic `chain` script across multiple projects.
+**Current state:** v5.9.0, 4140+ lines, 209 tests, 12 guard rail phases built. Powering the generic `chain` script across multiple projects.
 
 ## What Works
 
@@ -17,6 +17,7 @@
 - Session health dashboard (Phase 9)
 - Technical pattern extraction (Phase 10)
 - Next-task suggestion (Phase 11)
+- Failure fingerprinting (Phase 12)
 - Roadmap integration (scan project roadmaps, completion signals)
 - Context extraction from session DB
 - `check-can-continue` 5-stage decision pipeline
@@ -38,7 +39,7 @@ The engine is solid for "should we continue?" but weak on "what should we do nex
 
 - [x] Phase 10: Technical pattern extraction -- lessons about *what* was worked on, not just whether sessions were productive. Track which files/directories appear in failed sessions vs successful ones. Surface "geometry_os/src/vm.rs appears in 8/10 failed sessions" as a lesson. New command `analyze-patterns` that scans session messages for file paths and correlates with outcomes.
 - [x] Phase 11: Next-task suggestion -- when `chain` runs out of roadmap items (all checked), carry_forward should suggest the next logical task by analyzing: (a) what files were recently changed, (b) what the last session was working on when it stopped, (c) what uncommitted files exist. New command `suggest-next [project_dir]` that returns a ranked list of 3 candidate tasks with confidence scores. Also surfaces in `context` output and `get_context_data` JSON.
-- [ ] Phase 12: Failure fingerprinting -- when a session is marked unproductive, scan its tool calls for common failure patterns: build errors, test failures, timeout kills, compilation errors. Store failure fingerprints and surface them in context: "last 3 failures on this project were all compilation errors in src/parser.rs." New command `analyze-failures [project_dir]`.
+- [x] Phase 12: Failure fingerprinting -- when a session is marked unproductive, scan its tool calls for common failure patterns: build errors, test failures, timeout kills, compilation errors. Store failure fingerprints and surface them in context: "last 3 failures on this project were all compilation errors in src/parser.rs." New command `analyze-failures [project_dir]`. Auto-runs via `record_outcome` when sessions are marked unproductive.
 
 ## Design Principles
 
@@ -51,5 +52,5 @@ The engine is solid for "should we continue?" but weak on "what should we do nex
 
 - Every new guard rail gets a test in tests/test_carry_forward.py
 - Every new CLI command gets a test
-- 195 tests must stay green
+- 209 tests must stay green
 - Python 3.10+, no external dependencies for core (roadmap_builder is optional)

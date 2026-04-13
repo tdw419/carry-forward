@@ -106,6 +106,15 @@ def _create_carry_db(path):
             updated_at REAL NOT NULL,
             PRIMARY KEY (project_dir, key)
         )""",
+        """CREATE TABLE IF NOT EXISTS failure_fingerprints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            fingerprint_type TEXT NOT NULL,
+            file_path TEXT,
+            snippet TEXT,
+            project_dir TEXT,
+            created_at REAL NOT NULL
+        )""",
     ]:
         conn.execute(ddl)
     conn.commit()
@@ -269,6 +278,18 @@ def insert_messages(state_db, session_id, role, content):
     conn.execute(
         "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
         (session_id, role, content, time.time())
+    )
+    conn.commit()
+    conn.close()
+
+
+def insert_failure_fingerprint(carry_db, session_id, fingerprint_type,
+                               file_path=None, snippet=None, project_dir=None):
+    """Insert a failure fingerprint into the carry_forward DB."""
+    conn = sqlite3.connect(carry_db)
+    conn.execute(
+        "INSERT INTO failure_fingerprints (session_id, fingerprint_type, file_path, snippet, project_dir, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (session_id, fingerprint_type, file_path, snippet, project_dir, time.time())
     )
     conn.commit()
     conn.close()
