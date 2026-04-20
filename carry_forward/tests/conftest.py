@@ -115,6 +115,14 @@ def _create_carry_db(path):
             project_dir TEXT,
             created_at REAL NOT NULL
         )""",
+        """CREATE TABLE IF NOT EXISTS model_health_cache (
+            model TEXT PRIMARY KEY,
+            total_sessions INTEGER NOT NULL DEFAULT 0,
+            productive_sessions INTEGER NOT NULL DEFAULT 0,
+            productivity_rate REAL NOT NULL DEFAULT 0.0,
+            is_reliable INTEGER NOT NULL DEFAULT 1,
+            cached_at REAL NOT NULL
+        )""",
     ]:
         conn.execute(ddl)
     conn.commit()
@@ -145,11 +153,11 @@ def patched_env(state_db, carry_db):
         yield cf
 
 
-def insert_session(state_db, sid, parent=None, source='cli', msgs=0, tools=0, ts=None):
+def insert_session(state_db, sid, parent=None, source='cli', msgs=0, tools=0, ts=None, model=None):
     conn = sqlite3.connect(state_db)
     conn.execute(
-        "INSERT INTO sessions (id, parent_session_id, source, message_count, tool_call_count, started_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (sid, parent, source, msgs, tools, ts or time.time())
+        "INSERT INTO sessions (id, parent_session_id, source, message_count, tool_call_count, started_at, model) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (sid, parent, source, msgs, tools, ts or time.time(), model)
     )
     conn.commit()
     conn.close()
@@ -293,3 +301,32 @@ def insert_failure_fingerprint(carry_db, session_id, fingerprint_type,
     )
     conn.commit()
     conn.close()
+
+
+def insert_model_health_cache(carry_db, model, total_sessions=10, productive_sessions=8,
+                               productivity_rate=0.8, is_reliable=1):
+    """Insert a model health cache entry."""
+    conn = sqlite3.connect(carry_db)
+    conn.execute(
+        "INSERT OR REPLACE INTO model_health_cache (model, total_sessions, productive_sessions, productivity_rate, is_reliable, cached_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (model, total_sessions, productive_sessions, productivity_rate, is_reliable, time.time())
+    )
+    conn.commit()
+    conn.close()
+
+
+def insert_model_sessions(state_db, model, total=10, productive=8, source='cron'):
+    """Insert a batch of sessions for a given model to establish health stats.
+    
+    Creates `total` sessions, `productive` of which have tool_call_count > 0.
+    Returns list of session IDs.
+    """
+    ids = []
+    for i in range(total):
+        sid = f"{model.replace('-', '_').replace('.', '_')}_{i}"
+        tools = 5 if i < productive else 0
+        msgs = 10 if i < productive else 0
+        ts = time.time() - (total - i) * 100  # spread over time
+        insert_session(state_db, sid, source=source, msgs=msgs, tools=tools, ts=ts, model=model)
+        ids.append(sid)
+    return ids

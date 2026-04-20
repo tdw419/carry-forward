@@ -23,6 +23,8 @@ Usage:
     carry_forward.py calibrate [--project DIR]       # Auto-tune thresholds (global or per-project)
     carry_forward.py show-config [--project DIR]     # Show current threshold values
     carry_forward.py health [--json]                 # Session health dashboard for today
+    carry_forward.py model-health [--json]            # Model productivity rates and reliability
+    carry_forward.py retry-model [SESSION_ID]         # Check if last session was model failure
     carry_forward.py roadmap                      # Show roadmap progress for detected projects
     carry_forward.py analyze-patterns [DIR]       # Extract file-level patterns from session history
 """
@@ -800,6 +802,17 @@ def get_carry_conn() -> sqlite3.Connection:
             created_at REAL NOT NULL
         )
     """)
+    # v5.5: Model health cache -- avoid querying state.db every time
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS model_health_cache (
+            model TEXT PRIMARY KEY,
+            total_sessions INTEGER NOT NULL DEFAULT 0,
+            productive_sessions INTEGER NOT NULL DEFAULT 0,
+            productivity_rate REAL NOT NULL DEFAULT 0.0,
+            is_reliable INTEGER NOT NULL DEFAULT 1,
+            cached_at REAL NOT NULL
+        )
+    """)
     conn.commit()
     return conn
 
@@ -1038,6 +1051,305 @@ def check_git_progress(session_id: str, min_sessions: Optional[int] = None) -> T
 
 
 # ---------------------------------------------------------------------------
+# Model-aware dead session classification (v5.5)
+# ---------------------------------------------------------------------------
+
+# Default threshold: models below this productivity rate are "unreliable"
+MODEL_UNRELIABLE_THRESHOLD = 0.70  # 70% productivity = reliable
+MODEL_HEALTH_SAMPLE_SIZE = 50      # look at last 50 sessions per model
+MODEL_HEALTH_CACHE_TTL = 3600      # cache for 1 hour
+
+
+def _get_model_health(model_name: str) -> Dict[str, Any]:
+    """
+    Get productivity stats for a specific model.
+    
+    Queries state.db for the last N sessions using this model, calculates
+    the productivity rate (sessions with tool_call_count > 0), and caches
+    the result for 1 hour to avoid hammering state.db.
+    
+    Returns dict with:
+        model, total_sessions, productive_sessions, productivity_rate, is_reliable
+    """
+    if not model_name:
+        return {
+            "model": model_name or "unknown",
+            "total_sessions": 0,
+            "productive_sessions": 0,
+            "productivity_rate": 0.0,
+            "is_reliable": True,  # unknown model = don't penalize
+        }
+    
+    # Check cache first
+    carry_conn = get_carry_conn()
+    cached = carry_conn.execute("""
+        SELECT total_sessions, productive_sessions, productivity_rate, is_reliable, cached_at
+        FROM model_health_cache WHERE model = ?
+    """, (model_name,)).fetchone()
+    
+    now = time.time()
+    if cached and (now - (cached[4] or 0)) < MODEL_HEALTH_CACHE_TTL:
+        carry_conn.close()
+        return {
+            "model": model_name,
+            "total_sessions": cached[0],
+            "productive_sessions": cached[1],
+            "productivity_rate": cached[2],
+            "is_reliable": bool(cached[3]),
+        }
+    carry_conn.close()
+    
+    # Query state.db
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT tool_call_count FROM sessions
+        WHERE model = ?
+        ORDER BY started_at DESC LIMIT ?
+    """, (model_name, MODEL_HEALTH_SAMPLE_SIZE)).fetchall()
+    conn.close()
+    
+    total = len(rows)
+    productive = sum(1 for r in rows if r[0] > 0)
+    rate = productive / total if total > 0 else 0.0
+    is_reliable = rate >= MODEL_UNRELIABLE_THRESHOLD if total >= 5 else True
+    
+    result = {
+        "model": model_name,
+        "total_sessions": total,
+        "productive_sessions": productive,
+        "productivity_rate": rate,
+        "is_reliable": is_reliable,
+    }
+    
+    # Update cache
+    carry_conn2 = get_carry_conn()
+    carry_conn2.execute("""
+        INSERT OR REPLACE INTO model_health_cache
+        (model, total_sessions, productive_sessions, productivity_rate, is_reliable, cached_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (model_name, total, productive, rate, 1 if is_reliable else 0, now))
+    carry_conn2.commit()
+    carry_conn2.close()
+    
+    return result
+
+
+def _is_model_failure(session_id: str) -> Tuple[bool, Optional[str]]:
+    """
+    Check if a dead session was caused by model failure rather than task issues.
+    
+    A session is a "model failure" if:
+      1. It has 0 tool calls (dead session criteria)
+      2. The model it used has a high dead-rate (>70% of its sessions are unproductive)
+    
+    Returns (is_model_failure, model_name).
+    """
+    if not session_id:
+        return False, None
+    
+    conn = get_conn()
+    row = conn.execute("""
+        SELECT model, tool_call_count, message_count FROM sessions WHERE id = ?
+    """, (session_id,)).fetchone()
+    conn.close()
+    
+    if not row:
+        return False, None
+    
+    model_name, tool_calls, msg_count = row
+    
+    # Only check dead sessions (0 tool calls)
+    if tool_calls > 0:
+        return False, model_name
+    
+    if not model_name:
+        return False, None
+    
+    health = _get_model_health(model_name)
+    
+    # Model is unreliable if it has enough sample data AND low productivity
+    if not health["is_reliable"] and health["total_sessions"] >= 5:
+        return True, model_name
+    
+    return False, model_name
+
+
+def _get_suggested_replacement_model(failed_model: str) -> Optional[str]:
+    """
+    Find a reliable model to suggest as replacement for a failed one.
+    
+    Looks at models that have >80% productivity rate with >= 10 sessions.
+    Prefers models most commonly used in recent sessions.
+    """
+    if not failed_model:
+        return None
+    
+    # Get all models from recent sessions and their health
+    conn = get_conn()
+    models = conn.execute("""
+        SELECT model, COUNT(*) as cnt
+        FROM sessions
+        WHERE started_at > ? AND model IS NOT NULL AND model != ''
+        GROUP BY model
+        ORDER BY cnt DESC
+        LIMIT 20
+    """, (time.time() - 7 * 86400,)).fetchall()  # last 7 days
+    conn.close()
+    
+    best_model = None
+    best_score = -1
+    
+    for model_name, usage_count in models:
+        if model_name == failed_model:
+            continue
+        health = _get_model_health(model_name)
+        if health["is_reliable"] and health["total_sessions"] >= 5:
+            # Score: productivity_rate * usage_count (prefer popular reliable models)
+            score = health["productivity_rate"] * min(usage_count, 50)
+            if score > best_score:
+                best_score = score
+                best_model = model_name
+    
+    return best_model
+
+
+def cmd_retry_model(session_id: Optional[str] = None) -> None:
+    """
+    Check if the last session (or given session) was a model failure.
+    If so, output the failed model and suggested replacement.
+    
+    Exit codes:
+      0 = model failure detected, replacement suggested
+      1 = not a model failure (or no session found)
+    """
+    # Resolve session_id
+    if not session_id:
+        conn = get_conn()
+        row = conn.execute("""
+            SELECT id FROM sessions
+            ORDER BY started_at DESC LIMIT 1
+        """).fetchone()
+        conn.close()
+        session_id = row[0] if row else None
+    
+    if not session_id:
+        print(json.dumps({"model_failure": False, "reason": "no session found"}))
+        sys.exit(1)
+    
+    is_failure, model_name = _is_model_failure(session_id)
+    
+    if not is_failure:
+        print(json.dumps({
+            "model_failure": False,
+            "session_id": session_id,
+            "model": model_name,
+        }))
+        sys.exit(1)
+    
+    replacement = _get_suggested_replacement_model(model_name)
+    print(json.dumps({
+        "model_failure": True,
+        "session_id": session_id,
+        "failed_model": model_name,
+        "suggested_replacement": replacement,
+    }))
+    sys.exit(0)
+
+
+def cmd_model_health(json_output: bool = False) -> None:
+    """
+    Show model productivity dashboard.
+    
+    For each model seen in recent sessions, shows:
+      - Total sessions, productive sessions, productivity rate
+      - Whether it's marked reliable or unreliable
+      - Suggested replacements for unreliable models
+    """
+    # Get all models from recent sessions
+    conn = get_conn()
+    models = conn.execute("""
+        SELECT model, COUNT(*) as cnt,
+               SUM(CASE WHEN tool_call_count > 0 THEN 1 ELSE 0 END) as prod,
+               MAX(started_at) as last_seen
+        FROM sessions
+        WHERE model IS NOT NULL AND model != ''
+        GROUP BY model
+        ORDER BY cnt DESC
+    """).fetchall()
+    conn.close()
+    
+    if json_output:
+        results = []
+        for model_name, total, productive, last_seen in models:
+            health = _get_model_health(model_name)
+            entry = {
+                "model": model_name,
+                "total_sessions": total,
+                "productive_sessions": productive,
+                "productivity_rate": round(productive / total, 3) if total else 0,
+                "is_reliable": health["is_reliable"],
+                "last_seen": datetime.fromtimestamp(last_seen).isoformat() if last_seen else None,
+            }
+            if not health["is_reliable"]:
+                entry["suggested_replacement"] = _get_suggested_replacement_model(model_name)
+            results.append(entry)
+        print(json.dumps(results, indent=2))
+        return
+    
+    # ASCII dashboard
+    print("=== MODEL HEALTH DASHBOARD ===")
+    print()
+    
+    if not models:
+        print("  No models found in session history.")
+        return
+    
+    reliable = []
+    unreliable = []
+    
+    for model_name, total, productive, last_seen in models:
+        health = _get_model_health(model_name)
+        rate = productive / total if total else 0
+        last_ts = datetime.fromtimestamp(last_seen).strftime("%Y-%m-%d %H:%M") if last_seen else "?"
+        entry = {
+            "model": model_name,
+            "total": total,
+            "productive": productive,
+            "rate": rate,
+            "last_seen": last_ts,
+            "replacement": _get_suggested_replacement_model(model_name) if not health["is_reliable"] else None,
+        }
+        if health["is_reliable"]:
+            reliable.append(entry)
+        else:
+            unreliable.append(entry)
+    
+    if unreliable:
+        print("  UNRELIABLE MODELS (high dead-rate):")
+        for e in unreliable:
+            bar_len = int(e["rate"] * 20)
+            bar = "#" * bar_len + "-" * (20 - bar_len)
+            print(f"    {e['model']}")
+            print(f"      {e['productive']}/{e['total']} productive ({e['rate']:.0%}) [{bar}]")
+            print(f"      Last seen: {e['last_seen']}")
+            if e["replacement"]:
+                print(f"      Suggested replacement: {e['replacement']}")
+            print()
+    
+    if reliable:
+        print("  RELIABLE MODELS:")
+        for e in reliable:
+            bar_len = int(e["rate"] * 20)
+            bar = "#" * bar_len + "-" * (20 - bar_len)
+            print(f"    {e['model']}")
+            print(f"      {e['productive']}/{e['total']} productive ({e['rate']:.0%}) [{bar}]")
+            print(f"      Last seen: {e['last_seen']}")
+        print()
+    
+    print(f"  Total models: {len(models)} | {len(reliable)} reliable | {len(unreliable)} unreliable")
+
+
+# ---------------------------------------------------------------------------
 # Thrash detection
 # ---------------------------------------------------------------------------
 
@@ -1206,8 +1518,40 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
     # Check 1: Dead session thrash (chain has too many dead sessions)
     # But don't halt if the current session is already active -- a productive
     # session shouldn't be killed because its ancestors were dead.
+    # v5.5: Model-aware -- don't count dead sessions caused by unreliable models
+    # toward the thrash threshold. Those are model failures, not task thrashing.
+    model_failure_sessions = set()
     if thrashing and own_tools == 0:
-        reasons.append(f"Thrash: {dead_count} dead sessions in recent chain ({details})")
+        # Check each dead session in the chain for model failure
+        dead_in_chain = [s for s in chain_sessions[:get_threshold("dead_lookback")] if not s["alive"]]
+        for s in dead_in_chain:
+            mf, _ = _is_model_failure(s["id"])
+            if mf:
+                model_failure_sessions.add(s["id"])
+        
+        # Recount dead sessions excluding model failures
+        adjusted_dead = dead_count - len(model_failure_sessions)
+        adjusted_thrashing = adjusted_dead >= get_threshold("dead_session_threshold")
+        
+        if model_failure_sessions:
+            guard_rails.append(
+                f"Model failure: {len(model_failure_sessions)} dead session(s) caused by unreliable model"
+            )
+        
+        if adjusted_thrashing:
+            reasons.append(f"Thrash: {dead_count} dead sessions in recent chain ({details})"
+                          + (f" [{len(model_failure_sessions)} model failures excluded]" if model_failure_sessions else ""))
+            thrashing = True
+        else:
+            # Was thrashing, but model failures explain enough of it
+            thrashing = False
+            if own_tools > 0:
+                guard_rails.append(f"Thrash detected but session is active: {details}")
+            else:
+                guard_rails.append(
+                    f"Thrash would halt ({dead_count} dead) but {len(model_failure_sessions)} "
+                    f"model failure(s) excluded -> adjusted to {adjusted_dead}"
+                )
     elif thrashing:
         guard_rails.append(f"Thrash detected but session is active: {details}")
         thrashing = False  # Active session overrides chain thrash
@@ -1238,16 +1582,30 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
             reasons.append(f"Stale blocker ({age_h:.1f}h old): {msg}")
         blocker_halt = True
 
-    # Check 5: Session activity (v5.2 -- expanded)
+    # Check 5: Session activity (v5.2 -- expanded, v5.5 -- model-aware)
     # 5a: If this session itself has 0 tool calls and <=2 messages, it's dead.
+    # v5.5: But if it's dead because of an unreliable model, don't halt the chain.
     # (own_tools/own_msgs already fetched before Check 1)
     session_dead = False
+    session_model_failure = False
+    session_model_name = None
     parent_dead = False
     if own_tools == 0 and own_msgs <= 2:
-        session_dead = True
-        reasons.append(f"Session dead: 0 tool calls, {own_msgs} messages")
+        # Check if this is a model failure before declaring it dead
+        mf, mf_model = _is_model_failure(resolved_session_id or "")
+        if mf:
+            session_model_failure = True
+            session_model_name = mf_model
+            guard_rails.append(
+                f"Session dead but model failure: model={mf_model} is unreliable"
+            )
+            # Don't set session_dead -- model failure doesn't count as real death
+        else:
+            session_dead = True
+            reasons.append(f"Session dead: 0 tool calls, {own_msgs} messages")
 
     # 5b: Parent dead check -- if parent had 0 tools and <=2 msgs, continuation is pointless
+    # v5.5: But if the parent died because of an unreliable model, don't count it as dead
     conn_check = get_conn()
     if not session_dead and resolved_session_id:
         parent_row = conn_check.execute(
@@ -1260,8 +1618,15 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
                 (parent_row[0],)
             ).fetchone()
             if p_row and p_row[0] == 0 and p_row[1] <= 2:
-                parent_dead = True
-                reasons.append(f"Parent session dead: 0 tool calls, {p_row[1]} messages")
+                # Check if parent death was a model failure
+                parent_mf, _ = _is_model_failure(parent_row[0])
+                if parent_mf:
+                    guard_rails.append(
+                        f"Parent session dead but model failure (parent={parent_row[0]})"
+                    )
+                else:
+                    parent_dead = True
+                    reasons.append(f"Parent session dead: 0 tool calls, {p_row[1]} messages")
     conn_check.close()
 
     # Check 6: Git stall + dead session combo
@@ -1332,16 +1697,27 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
     # Unified metric: no commit AND no test increase = no-op.
     # Hard halt after noop_limit consecutive no-ops with no active tools.
     # Phase 7: Uses project-aware noop_limit.
+    # v5.5: If the chain is all model failures, the no-ops are explained by
+    # model failures, not task issues. Suppress noop halt in that case.
     noop_halt = False
     noop_limit = get_threshold_for_project("noop_limit", project_dir)
     consecutive_noops = _count_consecutive_noops(resolved_session_id or "")
     is_noop = (git_stalled and not test_regression_halt)  # no commit and no test crash
     _update_noop_counter(resolved_session_id or "", is_noop)
     if consecutive_noops >= noop_limit and own_tools == 0:
-        noop_halt = True
-        reasons.append(
-            f"No-op loop: {consecutive_noops} consecutive ticks with no commit or test increase"
-        )
+        # v5.5: Check if all recent dead sessions are model failures
+        # If the chain's dead sessions are mostly model failures, the no-ops
+        # are model-caused, not task-caused
+        if model_failure_sessions and len(model_failure_sessions) >= dead_count:
+            # All dead sessions were model failures -- no-ops are explained
+            guard_rails.append(
+                f"No-op loop detected ({consecutive_noops} no-ops) but all dead sessions are model failures"
+            )
+        else:
+            noop_halt = True
+            reasons.append(
+                f"No-op loop: {consecutive_noops} consecutive ticks with no commit or test increase"
+            )
     elif consecutive_noops >= noop_limit:
         guard_rails.append(
             f"No-op loop detected ({consecutive_noops} no-ops) but session is active"
@@ -1429,6 +1805,9 @@ def check_can_continue(session_id: Optional[str] = None) -> Dict[str, Any]:
         "consecutive_noops": consecutive_noops,
         "roadmap_signal": roadmap_signal,
         "project_dir": project_dir,
+        "session_model_failure": session_model_failure,
+        "session_model_name": session_model_name,
+        "model_failure_sessions": list(model_failure_sessions),
     }
 
 
@@ -4123,6 +4502,13 @@ if __name__ == "__main__":
 
     elif cmd == "health":
         cmd_health(json_output="--json" in sys.argv)
+
+    elif cmd == "model-health":
+        cmd_model_health(json_output="--json" in sys.argv)
+
+    elif cmd == "retry-model":
+        sid = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else None
+        cmd_retry_model(sid)
 
     elif cmd == "analyze-patterns":
         project = None
